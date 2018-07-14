@@ -7,12 +7,11 @@ import (
 
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/terraform/configs/configschema"
-	"github.com/hashicorp/terraform/tfdiags"
-
 	"github.com/hashicorp/terraform/addrs"
-
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/dag"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // ContextGraphWalker is the GraphWalker implementation used with the
@@ -22,6 +21,7 @@ type ContextGraphWalker struct {
 
 	// Configurable values
 	Context            *Context
+	State              *states.SyncState // Used for safe concurrent access to state
 	Operation          walkOperation
 	StopContext        context.Context
 	RootVariableValues InputValues
@@ -63,8 +63,7 @@ func (w *ContextGraphWalker) EnterPath(path addrs.ModuleInstance) EvalContext {
 		Meta:               w.Context.meta,
 		Config:             w.Context.config,
 		Operation:          w.Operation,
-		State:              w.Context.state,
-		StateLock:          &w.Context.stateLock,
+		State:              w.State,
 		Schemas:            w.Context.schemas,
 		VariableValues:     w.variableValues,
 		VariableValuesLock: &w.variableValuesLock,
@@ -84,8 +83,7 @@ func (w *ContextGraphWalker) EnterPath(path addrs.ModuleInstance) EvalContext {
 		ProvisionerLock:     &w.provisionerLock,
 		DiffValue:           w.Context.diff,
 		DiffLock:            &w.Context.diffLock,
-		StateValue:          w.Context.state,
-		StateLock:           &w.Context.stateLock,
+		StateValue:          w.State,
 		Evaluator:           evaluator,
 		VariableValues:      w.variableValues,
 		VariableValuesLock:  &w.variableValuesLock,

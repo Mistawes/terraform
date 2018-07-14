@@ -7,17 +7,16 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hashicorp/terraform/lang"
-
-	"github.com/hashicorp/terraform/addrs"
-
-	"github.com/hashicorp/terraform/configs"
-	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/hashicorp/hcl"
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/hcl"
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/version"
+	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/lang"
+	"github.com/hashicorp/terraform/plans"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // InputMode defines what sort of input will be asked for when Input
@@ -54,19 +53,18 @@ var (
 // ContextOpts are the user-configurable options to create a context with
 // NewContext.
 type ContextOpts struct {
-	Meta               *ContextMeta
-	Destroy            bool
-	Diff               *Diff
-	Hooks              []Hook
-	Config             *configs.Config
-	Parallelism        int
-	State              *State
-	StateFutureAllowed bool
-	ProviderResolver   ResourceProviderResolver
-	Provisioners       map[string]ResourceProvisionerFactory
-	Shadow             bool
-	Targets            []addrs.Targetable
-	Variables          InputValues
+	Config    *configs.Config
+	Diff      *Diff
+	State     *states.State
+	Targets   []addrs.Targetable
+	Variables InputValues
+	Meta      *ContextMeta
+	Destroy   bool
+
+	Hooks            []Hook
+	Parallelism      int
+	ProviderResolver ResourceProviderResolver
+	Provisioners     map[string]ResourceProvisionerFactory
 
 	// If non-nil, will apply as additional constraints on the provider
 	// plugins that will be requested from the provider resolver.
@@ -86,29 +84,22 @@ type ContextMeta struct {
 
 // Context represents all the context that Terraform needs in order to
 // perform operations on infrastructure. This structure is built using
-// NewContext. See the documentation for that.
-//
-// Extra functions on Context can be found in context_*.go files.
+// NewContext.
 type Context struct {
-	// Maintainer note: Anytime this struct is changed, please verify
-	// that newShadowContext still does the right thing. Tests should
-	// fail regardless but putting this note here as well.
+	config    *configs.Config
+	diff      *Diff
+	diffLock  sync.RWMutex
+	state     *states.State
+	targets   []addrs.Targetable
+	variables InputValues
+	meta      *ContextMeta
+	destroy   bool
 
+	hooks      []Hook
 	components contextComponentFactory
 	schemas    *Schemas
-	destroy    bool
-	diff       *Diff
-	diffLock   sync.RWMutex
-	hooks      []Hook
-	meta       *ContextMeta
-	config     *configs.Config
 	sh         *stopHook
-	shadow     bool
-	state      *State
-	stateLock  sync.RWMutex
-	targets    []addrs.Targetable
 	uiInput    UIInput
-	variables  InputValues
 
 	l                   sync.Mutex // Lock acquired during any task
 	parallelSem         Semaphore
@@ -121,9 +112,11 @@ type Context struct {
 	shadowErr           error
 }
 
+// (additional methods on Context can be found in context_*.go files.)
+
 // NewContext creates a new Context structure.
 //
-// Once a Context is created, the caller should not access or mutate any of
+// Once a Context is created, the caller must not access or mutate any of
 // the objects referenced (directly or indirectly) by the ContextOpts fields.
 //
 // If the returned diagnostics contains errors then the resulting context is
@@ -146,21 +139,8 @@ func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
 
 	state := opts.State
 	if state == nil {
-		state = new(State)
-		state.init()
+		state = states.NewState()
 	}
-
-	// If our state is from the future, then error. Callers can avoid
-	// this error by explicitly setting `StateFutureAllowed`.
-	if stateDiags := CheckStateVersion(state, opts.StateFutureAllowed); stateDiags.HasErrors() {
-		diags = diags.Append(stateDiags)
-		return nil, diags
-	}
-
-	// Explicitly reset our state version to our current version so that
-	// any operations we do will write out that our latest version
-	// has run.
-	state.TFVersion = version.Version
 
 	// Determine parallelism, default to 10. We do this both to limit
 	// CPU pressure but also to have an extra guard against rate throttling
@@ -227,7 +207,6 @@ func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
 		hooks:      hooks,
 		meta:       opts.Meta,
 		config:     opts.Config,
-		shadow:     opts.Shadow,
 		state:      state,
 		targets:    opts.Targets,
 		uiInput:    opts.UIInput,
@@ -356,7 +335,7 @@ func (c *Context) ShadowError() error {
 // State returns a copy of the current state associated with this context.
 //
 // This cannot safely be called in parallel with any other Context function.
-func (c *Context) State() *State {
+func (c *Context) State() *states.State {
 	return c.state.DeepCopy()
 }
 
@@ -398,9 +377,6 @@ func (c *Context) Eval(path addrs.ModuleInstance) (*lang.Scope, tfdiags.Diagnost
 		walker, walkDiags = c.walk(graph, walkEval)
 		diags = diags.Append(walker.NonFatalDiagnostics)
 		diags = diags.Append(walkDiags)
-
-		// Clean out any unused things
-		c.state.prune()
 	}
 
 	if walker == nil {
@@ -441,7 +417,7 @@ func (c *Context) Interpolater() *Interpolater {
 //       State() method. Currently the helper/resource testing framework relies
 //       on the absence of a returned state to determine if Destroy can be
 //       called, so that will need to be refactored before this can be changed.
-func (c *Context) Apply() (*State, tfdiags.Diagnostics) {
+func (c *Context) Apply() (*states.State, tfdiags.Diagnostics) {
 	defer c.acquireRun("apply")()
 
 	// Copy our own state
@@ -464,9 +440,6 @@ func (c *Context) Apply() (*State, tfdiags.Diagnostics) {
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
 
-	// Clean out any unused things
-	c.state.prune()
-
 	return c.state, diags
 }
 
@@ -477,39 +450,27 @@ func (c *Context) Apply() (*State, tfdiags.Diagnostics) {
 //
 // Plan also updates the diff of this context to be the diff generated
 // by the plan, so Apply can be called after.
-func (c *Context) Plan() (*Plan, tfdiags.Diagnostics) {
+func (c *Context) Plan() (*plans.Plan, tfdiags.Diagnostics) {
 	defer c.acquireRun("plan")()
 
-	// The Plan struct wants the legacy-style of targets as a simple []string,
-	// so we must shim that here.
-	legacyTargets := make([]string, len(c.targets))
-	for i, addr := range c.targets {
-		legacyTargets[i] = addr.String()
-	}
-
 	var diags tfdiags.Diagnostics
-	p := &Plan{
-		Config:  c.config,
-		Vars:    c.variables.JustValues(),
-		State:   c.state,
-		Targets: legacyTargets,
 
-		TerraformVersion: version.String(),
-		ProviderSHA256s:  c.providerSHA256s,
+	p := &plans.Plan{
+		VariableValues:  c.variables.JustValues(),
+		TargetAddrs:     c.targets,
+		ProviderSHA256s: c.providerSHA256s,
 	}
 
 	var operation walkOperation
 	if c.destroy {
 		operation = walkPlanDestroy
-		p.Destroy = true
 	} else {
 		// Set our state to be something temporary. We do this so that
 		// the plan can update a fake state so that variables work, then
 		// we replace it back with our old state.
 		old := c.state
 		if old == nil {
-			c.state = &State{}
-			c.state.init()
+			c.state = states.NewState()
 		} else {
 			c.state = old.DeepCopy()
 		}
@@ -546,17 +507,6 @@ func (c *Context) Plan() (*Plan, tfdiags.Diagnostics) {
 	}
 	p.Diff = c.diff
 
-	// If this is true, it means we're running unit tests. In this case,
-	// we perform a deep copy just to ensure that all context tests also
-	// test that a diff is copy-able. This will panic if it fails. This
-	// is enabled during unit tests.
-	//
-	// This should never be true during production usage, but even if it is,
-	// it can't do any real harm.
-	if contextTestDeepCopyOnPlan {
-		p.Diff.DeepCopy()
-	}
-
 	return p, diags
 }
 
@@ -566,7 +516,7 @@ func (c *Context) Plan() (*Plan, tfdiags.Diagnostics) {
 //
 // Even in the case an error is returned, the state may be returned and
 // will potentially be partially updated.
-func (c *Context) Refresh() (*State, tfdiags.Diagnostics) {
+func (c *Context) Refresh() (*states.State, tfdiags.Diagnostics) {
 	defer c.acquireRun("refresh")()
 
 	// Copy our own state
@@ -584,9 +534,6 @@ func (c *Context) Refresh() (*State, tfdiags.Diagnostics) {
 	if walkDiags.HasErrors() {
 		return nil, diags
 	}
-
-	// Clean out any unused things
-	c.state.prune()
 
 	return c.state, diags
 }
@@ -760,6 +707,7 @@ func (c *Context) walk(graph *Graph, operation walkOperation) (*ContextGraphWalk
 func (c *Context) graphWalker(operation walkOperation) *ContextGraphWalker {
 	return &ContextGraphWalker{
 		Context:            c,
+		State:              c.state.SyncWrapper(),
 		Operation:          operation,
 		StopContext:        c.runContext,
 		RootVariableValues: c.variables,

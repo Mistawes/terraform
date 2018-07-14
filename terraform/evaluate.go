@@ -8,15 +8,17 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/terraform/states"
+
 	"github.com/agext/levenshtein"
 	"github.com/hashicorp/hcl2/hcl"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
 
 	"github.com/hashicorp/terraform/addrs"
-	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/config/hcl2shim"
 	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/lang"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -52,11 +54,9 @@ type Evaluator struct {
 	// This must not be mutated during evaluation.
 	Schemas *Schemas
 
-	// State is the current state. During some operations this structure
-	// is mutated concurrently, and so it must be accessed only while holding
-	// StateLock.
-	State     *State
-	StateLock *sync.RWMutex
+	// State is the current state, embedded in a wrapper that ensures that
+	// it can be safely accessed and modified concurrently.
+	State *states.SyncState
 }
 
 // Scope creates an evaluation scope for the given module path and optional

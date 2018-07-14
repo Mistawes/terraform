@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/lang"
+	"github.com/hashicorp/terraform/states"
 	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -127,5 +128,5 @@ type EvalContext interface {
 
 	// State returns the global state as well as the lock that should
 	// be used to modify that state.
-	State() (*State, *sync.RWMutex)
+	State() *states.SyncState
 }
