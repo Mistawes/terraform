@@ -7,13 +7,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/backend/local"
 	"github.com/hashicorp/terraform/backend/remote-state/inmem"
-	"github.com/hashicorp/terraform/helper/copy"
-	"github.com/hashicorp/terraform/state"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/states/statemgr"
 	"github.com/mitchellh/cli"
+
+	legacy "github.com/hashicorp/terraform/internal/legacy/terraform"
 )
 
 func TestWorkspace_createAndChange(t *testing.T) {
@@ -25,19 +27,20 @@ func TestWorkspace_createAndChange(t *testing.T) {
 
 	newCmd := &WorkspaceNewCommand{}
 
-	current := newCmd.Workspace()
+	current, _ := newCmd.Workspace()
 	if current != backend.DefaultStateName {
 		t.Fatal("current workspace should be 'default'")
 	}
 
 	args := []string{"test"}
 	ui := new(cli.MockUi)
-	newCmd.Meta = Meta{Ui: ui}
+	view, _ := testView(t)
+	newCmd.Meta = Meta{Ui: ui, View: view}
 	if code := newCmd.Run(args); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
 	}
 
-	current = newCmd.Workspace()
+	current, _ = newCmd.Workspace()
 	if current != "test" {
 		t.Fatalf("current workspace should be 'test', got %q", current)
 	}
@@ -45,12 +48,12 @@ func TestWorkspace_createAndChange(t *testing.T) {
 	selCmd := &WorkspaceSelectCommand{}
 	args = []string{backend.DefaultStateName}
 	ui = new(cli.MockUi)
-	selCmd.Meta = Meta{Ui: ui}
+	selCmd.Meta = Meta{Ui: ui, View: view}
 	if code := selCmd.Run(args); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
 	}
 
-	current = newCmd.Workspace()
+	current, _ = newCmd.Workspace()
 	if current != backend.DefaultStateName {
 		t.Fatal("current workspace should be 'default'")
 	}
@@ -81,8 +84,9 @@ func TestWorkspace_createAndList(t *testing.T) {
 	// create multiple workspaces
 	for _, env := range envs {
 		ui := new(cli.MockUi)
+		view, _ := testView(t)
 		newCmd := &WorkspaceNewCommand{
-			Meta: Meta{Ui: ui},
+			Meta: Meta{Ui: ui, View: view},
 		}
 		if code := newCmd.Run([]string{env}); code != 0 {
 			t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
@@ -91,7 +95,8 @@ func TestWorkspace_createAndList(t *testing.T) {
 
 	listCmd := &WorkspaceListCommand{}
 	ui := new(cli.MockUi)
-	listCmd.Meta = Meta{Ui: ui}
+	view, _ := testView(t)
+	listCmd.Meta = Meta{Ui: ui, View: view}
 
 	if code := listCmd.Run(nil); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
@@ -126,7 +131,8 @@ func TestWorkspace_createAndShow(t *testing.T) {
 	// make sure current workspace show outputs "default"
 	showCmd := &WorkspaceShowCommand{}
 	ui := new(cli.MockUi)
-	showCmd.Meta = Meta{Ui: ui}
+	view, _ := testView(t)
+	showCmd.Meta = Meta{Ui: ui, View: view}
 
 	if code := showCmd.Run(nil); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
@@ -145,21 +151,21 @@ func TestWorkspace_createAndShow(t *testing.T) {
 
 	// create test_a workspace
 	ui = new(cli.MockUi)
-	newCmd.Meta = Meta{Ui: ui}
+	newCmd.Meta = Meta{Ui: ui, View: view}
 	if code := newCmd.Run(env); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
 	}
 
 	selCmd := &WorkspaceSelectCommand{}
 	ui = new(cli.MockUi)
-	selCmd.Meta = Meta{Ui: ui}
+	selCmd.Meta = Meta{Ui: ui, View: view}
 	if code := selCmd.Run(env); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
 	}
 
 	showCmd = &WorkspaceShowCommand{}
 	ui = new(cli.MockUi)
-	showCmd.Meta = Meta{Ui: ui}
+	showCmd.Meta = Meta{Ui: ui, View: view}
 
 	if code := showCmd.Run(nil); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
@@ -186,8 +192,9 @@ func TestWorkspace_createInvalid(t *testing.T) {
 	// create multiple workspaces
 	for _, env := range envs {
 		ui := new(cli.MockUi)
+		view, _ := testView(t)
 		newCmd := &WorkspaceNewCommand{
-			Meta: Meta{Ui: ui},
+			Meta: Meta{Ui: ui, View: view},
 		}
 		if code := newCmd.Run([]string{env}); code == 0 {
 			t.Fatalf("expected failure: \n%s", ui.OutputWriter)
@@ -197,7 +204,8 @@ func TestWorkspace_createInvalid(t *testing.T) {
 	// list workspaces to make sure none were created
 	listCmd := &WorkspaceListCommand{}
 	ui := new(cli.MockUi)
-	listCmd.Meta = Meta{Ui: ui}
+	view, _ := testView(t)
+	listCmd.Meta = Meta{Ui: ui, View: view}
 
 	if code := listCmd.Run(nil); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
@@ -213,38 +221,40 @@ func TestWorkspace_createInvalid(t *testing.T) {
 
 func TestWorkspace_createWithState(t *testing.T) {
 	td := tempDir(t)
-	copy.CopyDir(testFixturePath("inmem-backend"), td)
+	testCopyDir(t, testFixturePath("inmem-backend"), td)
 	defer os.RemoveAll(td)
 	defer testChdir(t, td)()
 	defer inmem.Reset()
 
 	// init the backend
 	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	initCmd := &InitCommand{
-		Meta: Meta{Ui: ui},
+		Meta: Meta{Ui: ui, View: view},
 	}
 	if code := initCmd.Run([]string{}); code != 0 {
 		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
 	}
 
-	// create a non-empty state
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
-					},
-				},
+	originalState := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"bar"}`),
+				Status:    states.ObjectReady,
 			},
-		},
-	}
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+	})
 
-	err := (&state.LocalState{Path: "test.tfstate"}).WriteState(originalState)
+	err := statemgr.NewFilesystem("test.tfstate").WriteState(originalState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,30 +264,29 @@ func TestWorkspace_createWithState(t *testing.T) {
 	args := []string{"-state", "test.tfstate", workspace}
 	ui = new(cli.MockUi)
 	newCmd := &WorkspaceNewCommand{
-		Meta: Meta{Ui: ui},
+		Meta: Meta{Ui: ui, View: view},
 	}
 	if code := newCmd.Run(args); code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter)
 	}
 
 	newPath := filepath.Join(local.DefaultWorkspaceDir, "test", DefaultStateFilename)
-	envState := state.LocalState{Path: newPath}
+	envState := statemgr.NewFilesystem(newPath)
 	err = envState.RefreshState()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	b := backend.TestBackendConfig(t, inmem.New(), nil)
-	sMgr, err := b.State(workspace)
+	sMgr, err := b.StateMgr(workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	newState := sMgr.State()
 
-	originalState.Version = newState.Version // the round-trip through the state manager implicitly populates version
-	if !originalState.Equal(newState) {
-		t.Fatalf("states not equal\norig: %s\nnew: %s", originalState, newState)
+	if got, want := newState.String(), originalState.String(); got != want {
+		t.Fatalf("states not equal\ngot: %s\nwant: %s", got, want)
 	}
 }
 
@@ -301,11 +310,12 @@ func TestWorkspace_delete(t *testing.T) {
 	}
 
 	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	delCmd := &WorkspaceDeleteCommand{
-		Meta: Meta{Ui: ui},
+		Meta: Meta{Ui: ui, View: view},
 	}
 
-	current := delCmd.Workspace()
+	current, _ := delCmd.Workspace()
 	if current != "test" {
 		t.Fatal("wrong workspace:", current)
 	}
@@ -328,11 +338,45 @@ func TestWorkspace_delete(t *testing.T) {
 		t.Fatalf("error deleting workspace: %s", ui.ErrorWriter)
 	}
 
-	current = delCmd.Workspace()
+	current, _ = delCmd.Workspace()
 	if current != backend.DefaultStateName {
 		t.Fatalf("wrong workspace: %q", current)
 	}
 }
+
+func TestWorkspace_deleteInvalid(t *testing.T) {
+	td := tempDir(t)
+	os.MkdirAll(td, 0755)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	// choose an invalid workspace name
+	workspace := "test workspace"
+	path := filepath.Join(local.DefaultWorkspaceDir, workspace)
+
+	// create the workspace directories
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	ui := new(cli.MockUi)
+	view, _ := testView(t)
+	delCmd := &WorkspaceDeleteCommand{
+		Meta: Meta{Ui: ui, View: view},
+	}
+
+	// delete the workspace
+	if code := delCmd.Run([]string{workspace}); code != 0 {
+		t.Fatalf("error deleting workspace: %s", ui.ErrorWriter)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("should have deleted workspace, but %s still exists", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error for workspace path: %s", err)
+	}
+}
+
 func TestWorkspace_deleteWithState(t *testing.T) {
 	td := tempDir(t)
 	os.MkdirAll(td, 0755)
@@ -345,14 +389,14 @@ func TestWorkspace_deleteWithState(t *testing.T) {
 	}
 
 	// create a non-empty state
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
+	originalState := &legacy.State{
+		Modules: []*legacy.ModuleState{
+			&legacy.ModuleState{
 				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
+				Resources: map[string]*legacy.ResourceState{
+					"test_instance.foo": &legacy.ResourceState{
 						Type: "test_instance",
-						Primary: &terraform.InstanceState{
+						Primary: &legacy.InstanceState{
 							ID: "bar",
 						},
 					},
@@ -361,15 +405,19 @@ func TestWorkspace_deleteWithState(t *testing.T) {
 		},
 	}
 
-	envStatePath := filepath.Join(local.DefaultWorkspaceDir, "test", DefaultStateFilename)
-	err := (&state.LocalState{Path: envStatePath}).WriteState(originalState)
+	f, err := os.Create(filepath.Join(local.DefaultWorkspaceDir, "test", "terraform.tfstate"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := legacy.WriteState(originalState, f); err != nil {
 		t.Fatal(err)
 	}
 
 	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	delCmd := &WorkspaceDeleteCommand{
-		Meta: Meta{Ui: ui},
+		Meta: Meta{Ui: ui, View: view},
 	}
 	args := []string{"test"}
 	if code := delCmd.Run(args); code == 0 {

@@ -10,7 +10,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/state/remote"
+	"github.com/hashicorp/terraform/states/remote"
 )
 
 const (
@@ -25,23 +25,19 @@ func TestStateFile(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		prefix           string
-		defaultStateFile string
-		name             string
-		wantStateFile    string
-		wantLockFile     string
+		prefix        string
+		name          string
+		wantStateFile string
+		wantLockFile  string
 	}{
-		{"state", "", "default", "state/default.tfstate", "state/default.tflock"},
-		{"state", "", "test", "state/test.tfstate", "state/test.tflock"},
-		{"state", "legacy.tfstate", "default", "legacy.tfstate", "legacy.tflock"},
-		{"state", "legacy.tfstate", "test", "state/test.tfstate", "state/test.tflock"},
-		{"state", "legacy.state", "default", "legacy.state", "legacy.state.tflock"},
-		{"state", "legacy.state", "test", "state/test.tfstate", "state/test.tflock"},
+		{"state", "default", "state/default.tfstate", "state/default.tflock"},
+		{"state", "test", "state/test.tfstate", "state/test.tflock"},
+		{"state", "test", "state/test.tfstate", "state/test.tflock"},
+		{"state", "test", "state/test.tfstate", "state/test.tflock"},
 	}
 	for _, c := range cases {
-		b := &gcsBackend{
-			prefix:           c.prefix,
-			defaultStateFile: c.defaultStateFile,
+		b := &Backend{
+			prefix: c.prefix,
 		}
 
 		if got := b.stateFile(c.name); got != c.wantStateFile {
@@ -61,14 +57,14 @@ func TestRemoteClient(t *testing.T) {
 	be := setupBackend(t, bucket, noPrefix, noEncryptionKey)
 	defer teardownBackend(t, be, noPrefix)
 
-	ss, err := be.State(backend.DefaultStateName)
+	ss, err := be.StateMgr(backend.DefaultStateName)
 	if err != nil {
-		t.Fatalf("be.State(%q) = %v", backend.DefaultStateName, err)
+		t.Fatalf("be.StateMgr(%q) = %v", backend.DefaultStateName, err)
 	}
 
 	rs, ok := ss.(*remote.State)
 	if !ok {
-		t.Fatalf("be.State(): got a %T, want a *remote.State", ss)
+		t.Fatalf("be.StateMgr(): got a %T, want a *remote.State", ss)
 	}
 
 	remote.TestClient(t, rs.Client)
@@ -80,14 +76,14 @@ func TestRemoteClientWithEncryption(t *testing.T) {
 	be := setupBackend(t, bucket, noPrefix, encryptionKey)
 	defer teardownBackend(t, be, noPrefix)
 
-	ss, err := be.State(backend.DefaultStateName)
+	ss, err := be.StateMgr(backend.DefaultStateName)
 	if err != nil {
-		t.Fatalf("be.State(%q) = %v", backend.DefaultStateName, err)
+		t.Fatalf("be.StateMgr(%q) = %v", backend.DefaultStateName, err)
 	}
 
 	rs, ok := ss.(*remote.State)
 	if !ok {
-		t.Fatalf("be.State(): got a %T, want a *remote.State", ss)
+		t.Fatalf("be.StateMgr(): got a %T, want a *remote.State", ss)
 	}
 
 	remote.TestClient(t, rs.Client)
@@ -101,14 +97,14 @@ func TestRemoteLocks(t *testing.T) {
 	defer teardownBackend(t, be, noPrefix)
 
 	remoteClient := func() (remote.Client, error) {
-		ss, err := be.State(backend.DefaultStateName)
+		ss, err := be.StateMgr(backend.DefaultStateName)
 		if err != nil {
 			return nil, err
 		}
 
 		rs, ok := ss.(*remote.State)
 		if !ok {
-			return nil, fmt.Errorf("be.State(): got a %T, want a *remote.State", ss)
+			return nil, fmt.Errorf("be.StateMgr(): got a %T, want a *remote.State", ss)
 		}
 
 		return rs.Client, nil
@@ -181,14 +177,13 @@ func setupBackend(t *testing.T, bucket, prefix, key string) backend.Backend {
 	}
 
 	config := map[string]interface{}{
-		"project":        projectID,
 		"bucket":         bucket,
 		"prefix":         prefix,
 		"encryption_key": key,
 	}
 
-	b := backend.TestBackendConfig(t, New(), config)
-	be := b.(*gcsBackend)
+	b := backend.TestBackendConfig(t, New(), backend.TestWrapConfig(config))
+	be := b.(*Backend)
 
 	// create the bucket if it doesn't exist
 	bkt := be.storageClient.Bucket(bucket)
@@ -199,9 +194,9 @@ func setupBackend(t *testing.T, bucket, prefix, key string) backend.Backend {
 		}
 
 		attrs := &storage.BucketAttrs{
-			Location: be.region,
+			Location: os.Getenv("GOOGLE_REGION"),
 		}
-		err := bkt.Create(be.storageContext, be.projectID, attrs)
+		err := bkt.Create(be.storageContext, projectID, attrs)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -213,7 +208,7 @@ func setupBackend(t *testing.T, bucket, prefix, key string) backend.Backend {
 // teardownBackend deletes all states from be except the default state.
 func teardownBackend(t *testing.T, be backend.Backend, prefix string) {
 	t.Helper()
-	gcsBE, ok := be.(*gcsBackend)
+	gcsBE, ok := be.(*Backend)
 	if !ok {
 		t.Fatalf("be is a %T, want a *gcsBackend", be)
 	}

@@ -3,6 +3,7 @@ package ssh
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,10 +18,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/terraform/communicator/remote"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/provisioners"
+	"github.com/zclconf/go-cty/cty"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	_ "github.com/hashicorp/terraform/internal/logging"
 )
 
 const (
@@ -28,20 +33,29 @@ const (
 	DefaultShebang = "#!/bin/sh\n"
 )
 
-// randShared is a global random generator object that is shared.
-// This must be shared since it is seeded by the current time and
-// creating multiple can result in the same values. By using a shared
-// RNG we assure different numbers per call.
-var randLock sync.Mutex
-var randShared *rand.Rand
+var (
+	// randShared is a global random generator object that is shared.  This must be
+	// shared since it is seeded by the current time and creating multiple can
+	// result in the same values. By using a shared RNG we assure different numbers
+	// per call.
+	randLock   sync.Mutex
+	randShared *rand.Rand
+
+	// enable ssh keeplive probes by default
+	keepAliveInterval = 2 * time.Second
+
+	// max time to wait for for a KeepAlive response before considering the
+	// connection to be dead.
+	maxKeepAliveDelay = 120 * time.Second
+)
 
 // Communicator represents the SSH communicator
 type Communicator struct {
-	connInfo *connectionInfo
-	client   *ssh.Client
-	config   *sshConfig
-	conn     net.Conn
-	address  string
+	connInfo        *connectionInfo
+	client          *ssh.Client
+	config          *sshConfig
+	conn            net.Conn
+	cancelKeepAlive context.CancelFunc
 
 	lock sync.Mutex
 }
@@ -72,8 +86,8 @@ func (e fatalError) FatalError() error {
 }
 
 // New creates a new communicator implementation over SSH.
-func New(s *terraform.InstanceState) (*Communicator, error) {
-	connInfo, err := parseConnectionInfo(s)
+func New(v cty.Value) (*Communicator, error) {
+	connInfo, err := parseConnectionInfo(v)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +97,7 @@ func New(s *terraform.InstanceState) (*Communicator, error) {
 		return nil, err
 	}
 
-	// Setup the random number generator once. The seed value is the
+	// Set up the random number generator once. The seed value is the
 	// time multiplied by the PID. This can overflow the int64 but that
 	// is okay. We multiply by the PID in case we have multiple processes
 	// grabbing this at the same time. This is possible with Terraform and
@@ -105,7 +119,7 @@ func New(s *terraform.InstanceState) (*Communicator, error) {
 }
 
 // Connect implementation of communicator.Communicator interface
-func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
+func (c *Communicator) Connect(o provisioners.UIOutput) (err error) {
 	// Grab a lock so we can modify our internal attributes
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -125,13 +139,17 @@ func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
 				"  User: %s\n"+
 				"  Password: %t\n"+
 				"  Private key: %t\n"+
+				"  Certificate: %t\n"+
 				"  SSH Agent: %t\n"+
-				"  Checking Host Key: %t",
+				"  Checking Host Key: %t\n"+
+				"  Target Platform: %s\n",
 			c.connInfo.Host, c.connInfo.User,
 			c.connInfo.Password != "",
 			c.connInfo.PrivateKey != "",
+			c.connInfo.Certificate != "",
 			c.connInfo.Agent,
 			c.connInfo.HostKey != "",
+			c.connInfo.TargetPlatform,
 		))
 
 		if c.connInfo.BastionHost != "" {
@@ -141,18 +159,21 @@ func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
 					"  User: %s\n"+
 					"  Password: %t\n"+
 					"  Private key: %t\n"+
+					"  Certificate: %t\n"+
 					"  SSH Agent: %t\n"+
 					"  Checking Host Key: %t",
 				c.connInfo.BastionHost, c.connInfo.BastionUser,
 				c.connInfo.BastionPassword != "",
 				c.connInfo.BastionPrivateKey != "",
+				c.connInfo.BastionCertificate != "",
 				c.connInfo.Agent,
 				c.connInfo.BastionHostKey != "",
 			))
 		}
 	}
 
-	log.Printf("[DEBUG] connecting to TCP connection for SSH")
+	hostAndPort := fmt.Sprintf("%s:%d", c.connInfo.Host, c.connInfo.Port)
+	log.Printf("[DEBUG] Connecting to %s for SSH", hostAndPort)
 	c.conn, err = c.config.connection()
 	if err != nil {
 		// Explicitly set this to the REAL nil. Connection() can return
@@ -167,10 +188,11 @@ func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
 		return err
 	}
 
-	log.Printf("[DEBUG] handshaking with SSH")
-	host := fmt.Sprintf("%s:%d", c.connInfo.Host, c.connInfo.Port)
-	sshConn, sshChan, req, err := ssh.NewClientConn(c.conn, host, c.config.config)
+	log.Printf("[DEBUG] Connection established. Handshaking for user %v", c.connInfo.User)
+	sshConn, sshChan, req, err := ssh.NewClientConn(c.conn, hostAndPort, c.config.config)
 	if err != nil {
+		err = errwrap.Wrapf(fmt.Sprintf("SSH authentication failed (%s@%s): {{err}}", c.connInfo.User, hostAndPort), err)
+
 		// While in theory this should be a fatal error, some hosts may start
 		// the ssh service before it is properly configured, or before user
 		// authentication data is available.
@@ -188,7 +210,7 @@ func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
 		}
 
 		log.Printf("[DEBUG] Setting up a session to request agent forwarding")
-		session, err := c.newSession()
+		session, err := c.client.NewSession()
 		if err != nil {
 			return err
 		}
@@ -203,17 +225,83 @@ func (c *Communicator) Connect(o terraform.UIOutput) (err error) {
 		}
 	}
 
+	if err != nil {
+		return err
+	}
+
 	if o != nil {
 		o.Output("Connected!")
 	}
 
-	return err
+	ctx, cancelKeepAlive := context.WithCancel(context.TODO())
+	c.cancelKeepAlive = cancelKeepAlive
+
+	// Start a keepalive goroutine to help maintain the connection for
+	// long-running commands.
+	log.Printf("[DEBUG] starting ssh KeepAlives")
+
+	// We want a local copy of the ssh client pointer, so that a reconnect
+	// doesn't race with the running keep-alive loop.
+	sshClient := c.client
+	go func() {
+		defer cancelKeepAlive()
+		// Along with the KeepAlives generating packets to keep the tcp
+		// connection open, we will use the replies to verify liveness of the
+		// connection. This will prevent dead connections from blocking the
+		// provisioner indefinitely.
+		respCh := make(chan error, 1)
+
+		go func() {
+			t := time.NewTicker(keepAliveInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					_, _, err := sshClient.SendRequest("keepalive@terraform.io", true, nil)
+					respCh <- err
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		after := time.NewTimer(maxKeepAliveDelay)
+		defer after.Stop()
+
+		for {
+			select {
+			case err := <-respCh:
+				if err != nil {
+					log.Printf("[ERROR] ssh keepalive: %s", err)
+					sshConn.Close()
+					return
+				}
+			case <-after.C:
+				// abort after too many missed keepalives
+				log.Println("[ERROR] no reply from ssh server")
+				sshConn.Close()
+				return
+			case <-ctx.Done():
+				return
+			}
+			if !after.Stop() {
+				<-after.C
+			}
+			after.Reset(maxKeepAliveDelay)
+		}
+	}()
+
+	return nil
 }
 
 // Disconnect implementation of communicator.Communicator interface
 func (c *Communicator) Disconnect() error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	if c.cancelKeepAlive != nil {
+		c.cancelKeepAlive()
+	}
 
 	if c.config.sshAgent != nil {
 		if err := c.config.sshAgent.Close(); err != nil {
@@ -254,12 +342,12 @@ func (c *Communicator) Start(cmd *remote.Cmd) error {
 		return err
 	}
 
-	// Setup our session
+	// Set up our session
 	session.Stdin = cmd.Stdin
 	session.Stdout = cmd.Stdout
 	session.Stderr = cmd.Stderr
 
-	if !c.config.noPty {
+	if !c.config.noPty && c.connInfo.TargetPlatform != TargetPlatformWindows {
 		// Request a PTY
 		termModes := ssh.TerminalModes{
 			ssh.ECHO:          0,     // do not echo
@@ -341,35 +429,35 @@ func (c *Communicator) UploadScript(path string, input io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("Error reading script: %s", err)
 	}
-
 	var script bytes.Buffer
-	if string(prefix) != "#!" {
+
+	if string(prefix) != "#!" && c.connInfo.TargetPlatform != TargetPlatformWindows {
 		script.WriteString(DefaultShebang)
 	}
-
 	script.ReadFrom(reader)
+
 	if err := c.Upload(path, &script); err != nil {
 		return err
 	}
+	if c.connInfo.TargetPlatform != TargetPlatformWindows {
+		var stdout, stderr bytes.Buffer
+		cmd := &remote.Cmd{
+			Command: fmt.Sprintf("chmod 0777 %s", path),
+			Stdout:  &stdout,
+			Stderr:  &stderr,
+		}
+		if err := c.Start(cmd); err != nil {
+			return fmt.Errorf(
+				"Error chmodding script file to 0777 in remote "+
+					"machine: %s", err)
+		}
 
-	var stdout, stderr bytes.Buffer
-	cmd := &remote.Cmd{
-		Command: fmt.Sprintf("chmod 0777 %s", path),
-		Stdout:  &stdout,
-		Stderr:  &stderr,
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf(
+				"Error chmodding script file to 0777 in remote "+
+					"machine %v: %s %s", err, stdout.String(), stderr.String())
+		}
 	}
-	if err := c.Start(cmd); err != nil {
-		return fmt.Errorf(
-			"Error chmodding script file to 0777 in remote "+
-				"machine: %s", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf(
-			"Error chmodding script file to 0777 in remote "+
-				"machine %v: %s %s", err, stdout.String(), stderr.String())
-	}
-
 	return nil
 }
 
@@ -481,6 +569,13 @@ func (c *Communicator) scpSession(scpCommand string, f func(io.Writer, *bufio.Re
 	// our data and has completed. Or has errored.
 	log.Println("[DEBUG] Waiting for SSH session to complete.")
 	err = session.Wait()
+
+	// log any stderr before exiting on an error
+	scpErr := stderr.String()
+	if len(scpErr) > 0 {
+		log.Printf("[ERROR] scp stderr: %q", stderr)
+	}
+
 	if err != nil {
 		if exitErr, ok := err.(*ssh.ExitError); ok {
 			// Otherwise, we have an ExitErorr, meaning we can just read
@@ -497,11 +592,6 @@ func (c *Communicator) scpSession(scpCommand string, f func(io.Writer, *bufio.Re
 		}
 
 		return err
-	}
-
-	scpErr := stderr.String()
-	if len(scpErr) > 0 {
-		log.Printf("[ERROR] scp stderr: %q", stderr)
 	}
 
 	return nil

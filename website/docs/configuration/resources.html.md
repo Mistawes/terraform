@@ -1,352 +1,135 @@
 ---
-layout: "docs"
-page_title: "Configuring Resources"
-sidebar_current: "docs-config-resources"
-description: |-
-  The most important thing you'll configure with Terraform are resources. Resources are a component of your infrastructure. It might be some low level component such as a physical server, virtual machine, or container. Or it can be a higher level component such as an email provider, DNS record, or database provider.
+layout: "language"
+page_title: "Resources Landing Page - Configuration Language"
 ---
 
-# Resource Configuration
+# Resources Landing Page
 
-The most important thing you'll configure with Terraform are
-resources. Resources are a component of your infrastructure.
-It might be some low level component such as a physical server,
-virtual machine, or container. Or it can be a higher level
-component such as an email provider, DNS record, or database
-provider.
+To improve navigation, we've split the old Resources page into several smaller
+pages.
 
-This page assumes you're familiar with the
-[configuration syntax](/docs/configuration/syntax.html)
-already.
+<a id="resource-syntax"></a>
+<a id="resource-types"></a>
+<a id="providers"></a>
+<a id="resource-arguments"></a>
+<a id="documentation-for-resource-types"></a>
+<a id="meta-arguments"></a>
+<a id="timeouts"></a>
+<a id="operation-timeouts"></a>
 
-## Example
+## Syntax and Elements of Resource Blocks
 
-A resource configuration looks like the following:
+This information has moved to
+[Resource Blocks](/docs/language/resources/syntax.html).
 
-```hcl
-resource "aws_instance" "web" {
-  ami           = "ami-408c7f28"
-  instance_type = "t1.micro"
-}
-```
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-## Description
 
-The `resource` block creates a resource of the given `TYPE` (first
-parameter) and `NAME` (second parameter). The combination of the type
-and name must be unique.
 
-Within the block (the `{ }`) is configuration for the resource. The
-configuration is dependent on the type, and is documented for each
-resource type in the
-[providers section](/docs/providers/index.html).
+<a id="resource-behavior"></a>
+<a id="accessing-resource-attributes"></a>
+<a id="resource-dependencies"></a>
+<a id="local-only-resources"></a>
 
-### Meta-parameters
+## Details of Resource Behavior
 
-There are **meta-parameters** available to all resources:
+This information has moved to
+[Resource Behavior](/docs/language/resources/behavior.html).
 
-- `count` (int) - The number of identical resources to create. This doesn't
-  apply to all resources. For details on using variables in conjunction with
-  count, see [Using Variables with `count`](#using-variables-with-count) below.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-    -> Modules don't currently support the `count` parameter.
 
-- `depends_on` (list of strings) - Explicit dependencies that this resource has.
-  These dependencies will be created before this resource. For syntax and other
-  details, see the section below on [explicit
-  dependencies](#explicit-dependencies).
 
-- `provider` (string) - The name of a specific provider to use for this
-  resource. The name is in the format of `TYPE.ALIAS`, for example, `aws.west`.
-  Where `west` is set using the `alias` attribute in a provider. See [multiple
-  provider instances](#multiple-provider-instances).
+## Resource Meta-Arguments
 
-- `lifecycle` (configuration block) - Customizes the lifecycle behavior of the
-  resource. The specific options are documented below.
+Each resource meta-argument has moved to its own page:
 
-    The `lifecycle` block allows the following keys to be set:
+- [`depends_on`](/docs/language/meta-arguments/depends_on.html)
+- [`count`](/docs/language/meta-arguments/count.html)
+- [`for_each`](/docs/language/meta-arguments/for_each.html)
+- [`provider`](/docs/language/meta-arguments/resource-provider.html)
+- [`lifecycle`](/docs/language/meta-arguments/lifecycle.html)
+- [Provisioners](/docs/language/resources/provisioners/index.html)
 
-  - `create_before_destroy` (bool) - This flag is used to ensure the replacement
-    of a resource is created before the original instance is destroyed. As an
-    example, this can be used to create an new DNS record before removing an old
-    record.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-  - `prevent_destroy` (bool) - This flag provides extra protection against the
-    destruction of a given resource. When this is set to `true`, any plan that
-    includes a destroy of this resource will return an error message.
 
-  - `ignore_changes` (list of strings) - Customizes how diffs are evaluated for
-    resources, allowing individual attributes to be ignored through changes. As
-    an example, this can be used to ignore dynamic changes to the resource from
-    external resources. Other meta-parameters cannot be ignored.
 
-        ~> Ignored attribute names can be matched by their name, not state ID.
-        For example, if an `aws_route_table` has two routes defined and the
-        `ignore_changes` list contains "route", both routes will be ignored.
-        Additionally you can also use a single entry with a wildcard (e.g. `"*"`)
-        which will match all attribute names. Using a partial string together
-        with a wildcard (e.g. `"rout*"`) is **not** supported.
+<a id="depends_on-explicit-resource-dependencies"></a>
 
-  -> Interpolations are not currently supported in the `lifecycle` configuration block (see [issue #3116](https://github.com/hashicorp/terraform/issues/3116))
+### `depends_on`
 
-### Timeouts
+This information has moved to
+[`depends_on`](/docs/language/meta-arguments/depends_on.html).
 
-Individual Resources may provide a `timeouts` block to enable users to configure the
-amount of time a specific operation is allowed to take before being considered
-an error. For example, the
-[aws_db_instance](/docs/providers/aws/r/db_instance.html#timeouts)
-resource provides configurable timeouts for the
-`create`, `update`, and `delete` operations. Any Resource that provides Timeouts
-will document the default values for that operation, and users can overwrite
-them in their configuration.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-Example overwriting the `create` and `delete` timeouts:
 
-```hcl
-resource "aws_db_instance" "timeout_example" {
-  allocated_storage = 10
-  engine            = "mysql"
-  engine_version    = "5.6.17"
-  instance_class    = "db.t1.micro"
-  name              = "mydb"
 
-  # ...
+<a id="count-multiple-resource-instances-by-count"></a>
+<a id="count-multiple-resource-instances"></a>
+<a id="the-count-object"></a>
+<a id="count-index"></a>
+<a id="referring-to-instances"></a>
+<a id="using-expressions-in-count"></a>
+<a id="when-to-use-for_each-instead-of-count"></a>
 
-  timeouts {
-    create = "60m"
-    delete = "2h"
-  }
-}
-```
+### `count`
 
-Individual Resources must opt-in to providing configurable Timeouts, and
-attempting to configure the timeout for a Resource that does not support
-Timeouts, or overwriting a specific action that the Resource does not specify as
-an option, will result in an error. Valid units of time are  `s`, `m`, `h`.
+This information has moved to
+[`count`](/docs/language/meta-arguments/count.html).
 
-### Explicit Dependencies
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-Terraform ensures that dependencies are successfully created before a
-resource is created. During a destroy operation, Terraform ensures that
-this resource is destroyed before its dependencies.
 
-A resource automatically depends on anything it references via
-[interpolations](/docs/configuration/interpolation.html). The automatically
-determined dependencies are all that is needed most of the time. You can also
-use the `depends_on` parameter to explicitly define a list of additional
-dependencies.
 
-The primary use case of explicit `depends_on` is to depend on a _side effect_
-of another operation. For example: if a provisioner creates a file, and your
-resource reads that file, then there is no interpolation reference for Terraform
-to automatically connect the two resources. However, there is a causal
-ordering that needs to be represented. This is an ideal case for `depends_on`.
-In most cases, however, `depends_on` should be avoided and Terraform should
-be allowed to determine dependencies automatically.
+<a id="for_each-multiple-resource-instances-defined-by-a-map-or-set-of-strings"></a>
+<a id="the-each-object"></a>
+<a id="each-key"></a>
+<a id="each-value"></a>
+<a id="using-expressions-in-for_each"></a>
+<a id="referring-to-instances-1"></a>
+<a id="using-sets"></a>
 
-The syntax of `depends_on` is a list of resources and modules:
+### `for_each`
 
-- Resources are `TYPE.NAME`, such as `aws_instance.web`.
-- Modules are `module.NAME`, such as `module.foo`.
+This information has moved to
+[`for_each`](/docs/language/meta-arguments/for_each.html).
 
-When a resource depends on a module, _everything_ in that module must be
-created before the resource is created.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-An example of a resource depending on both a module and resource is shown
-below. Note that `depends_on` can contain any number of dependencies:
 
-```hcl
-resource "aws_instance" "web" {
-  depends_on = ["aws_instance.leader", "module.vpc"]
-}
-```
 
--> **Use sparingly!** `depends_on` is rarely necessary.
-In almost every case, Terraform's automatic dependency system is the best-case
-scenario by having your resources depend only on what they explicitly use.
-Please think carefully before you use `depends_on` to determine if Terraform
-could automatically do this a better way.
+<a id="provider-selecting-a-non-default-provider-configuration"></a>
 
-### Connection block
+### `provider`
 
-Within a resource, you can optionally have a **connection block**.
-Connection blocks describe to Terraform how to connect to the
-resource for
-[provisioning](/docs/provisioners/index.html). This block doesn't
-need to be present if you're using only local provisioners, or
-if you're not provisioning at all.
+This information has moved to
+[`provider`](/docs/language/meta-arguments/resource-provider.html).
 
-Resources provide some data on their own, such as an IP address,
-but other data must be specified by the user.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-The full list of settings that can be specified are listed on
-the [provisioner connection page](/docs/provisioners/connection.html).
+
+
+<a id="lifecycle-lifecycle-customizations"></a>
+<a id="prevent_destroy"></a>
+<a id="create_before_destroy"></a>
+<a id="ignore_changes"></a>
+
+### `lifecycle`
+
+This information has moved to
+[`lifecycle`](/docs/language/meta-arguments/lifecycle.html).
+
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
+
+
+
+<a id="provisioner-and-connection-resource-provisioners"></a>
 
 ### Provisioners
 
-Within a resource, you can specify zero or more **provisioner
-blocks**. Provisioner blocks configure
-[provisioners](/docs/provisioners/index.html).
+This information has moved to
+[Provisioners](/docs/language/resources/provisioners/index.html).
 
-Within the provisioner block is provisioner-specific configuration,
-much like resource-specific configuration.
-
-Provisioner blocks can also contain a connection block
-(documented above). This connection block can be used to
-provide more specific connection info for a specific provisioner.
-An example use case might be to use a different user to log in
-for a single provisioner.
-
-## Using Variables With `count`
-
-When declaring multiple instances of a resource using [`count`](#count), it is
-common to want each instance to have a different value for a given attribute.
-
-You can use the `${count.index}`
-[interpolation](/docs/configuration/interpolation.html) along with a map
-[variable](/docs/configuration/variables.html) to accomplish this.
-
-For example, here's how you could create three [AWS
-Instances](/docs/providers/aws/r/instance.html) each with their own
-static IP address:
-
-```hcl
-variable "instance_ips" {
-  default = {
-    "0" = "10.11.12.100"
-    "1" = "10.11.12.101"
-    "2" = "10.11.12.102"
-  }
-}
-
-resource "aws_instance" "app" {
-  count = "3"
-  private_ip = "${lookup(var.instance_ips, count.index)}"
-  # ...
-}
-```
-
-To reference a particular instance of a resource you can use `resource.foo.*.id[#]` where `#` is the index number of the instance.
-
-For example, to create a list of all [AWS subnet](/docs/providers/aws/r/subnet.html) ids vs referencing a specific subnet in the list you can use this syntax:
-
-```hcl
-resource "aws_vpc" "foo" {
-  cidr_block = "198.18.0.0/16"
-}
-
-resource "aws_subnet" "bar" {
-  count      = 2
-  vpc_id     = "${aws_vpc.foo.id}"
-  cidr_block = "${cidrsubnet(aws_vpc.foo.cidr_block, 8, count.index)}"
-}
-
-output "vpc_id" {
-  value = "${aws_vpc.foo.id}"
-}
-
-output "all_subnet_ids" {
-  value = "${aws_subnet.bar.*.id}"
-}
-
-output "subnet_id_0" {
-  value = "${aws_subnet.bar.*.id[0]}"
-}
-
-output "subnet_id_1" {
-  value = "${aws_subnet.bar.*.id[1]}"
-}
-```
-
-## Multiple Provider Instances
-
-By default, a resource targets the provider based on its type. For example
-an `aws_instance` resource will target the "aws" provider. As of Terraform
-0.5.0, a resource can target any provider by name.
-
-The primary use case for this is to target a specific configuration of
-a provider that is configured multiple times to support multiple regions, etc.
-
-To target another provider, set the `provider` field:
-
-```hcl
-resource "aws_instance" "foo" {
-	provider = "aws.west"
-
-	# ...
-}
-```
-
-The value of the field should be `TYPE` or `TYPE.ALIAS`. The `ALIAS` value
-comes from the `alias` field value when configuring the
-[provider](/docs/configuration/providers.html).
-
-```hcl
-provider "aws" {
-  alias = "west"
-
-  # ...
-}
-```
-
-If no `provider` field is specified, the default provider is used.
-
-## Syntax
-
-The full syntax is:
-
-```text
-resource TYPE NAME {
-	CONFIG ...
-	[count = COUNT]
-	[depends_on = [NAME, ...]]
-	[provider = PROVIDER]
-
-    [LIFECYCLE]
-
-	[CONNECTION]
-	[PROVISIONER ...]
-}
-```
-
-where `CONFIG` is:
-
-```text
-KEY = VALUE
-
-KEY {
-	CONFIG
-}
-```
-
-where `LIFECYCLE` is:
-
-```text
-lifecycle {
-    [create_before_destroy = true|false]
-    [prevent_destroy = true|false]
-    [ignore_changes = [ATTRIBUTE NAME, ...]]
-}
-```
-
-where `CONNECTION` is:
-
-```text
-connection {
-	KEY = VALUE
-	...
-}
-```
-
-where `PROVISIONER` is:
-
-```text
-provisioner NAME {
-	CONFIG ...
-
-	[when = "create"|"destroy"]
-	[on_failure = "continue"|"fail"]
-
-	[CONNECTION]
-}
-```
+<div style="height: 100vh; margin: 0; padding: 0;"></div>

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform/e2e"
-	tfcore "github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/version"
 )
 
 func TestVersion(t *testing.T) {
@@ -18,7 +18,7 @@ func TestVersion(t *testing.T) {
 
 	t.Parallel()
 
-	fixturePath := filepath.Join("test-fixtures", "empty")
+	fixturePath := filepath.Join("testdata", "empty")
 	tf := e2e.NewBinary(terraformBin, fixturePath)
 	defer tf.Close()
 
@@ -31,7 +31,7 @@ func TestVersion(t *testing.T) {
 		t.Errorf("unexpected stderr output:\n%s", stderr)
 	}
 
-	wantVersion := fmt.Sprintf("Terraform v%s", tfcore.VersionString())
+	wantVersion := fmt.Sprintf("Terraform v%s", version.String())
 	if !strings.Contains(stdout, wantVersion) {
 		t.Errorf("output does not contain our current version %q:\n%s", wantVersion, stdout)
 	}
@@ -47,7 +47,7 @@ func TestVersionWithProvider(t *testing.T) {
 	// allowed.
 	skipIfCannotAccessNetwork(t)
 
-	fixturePath := filepath.Join("test-fixtures", "template-provider")
+	fixturePath := filepath.Join("testdata", "template-provider")
 	tf := e2e.NewBinary(terraformBin, fixturePath)
 	defer tf.Close()
 
@@ -63,7 +63,7 @@ func TestVersionWithProvider(t *testing.T) {
 			t.Errorf("unexpected stderr output:\n%s", stderr)
 		}
 
-		wantVersion := fmt.Sprintf("Terraform v%s", tfcore.VersionString())
+		wantVersion := fmt.Sprintf("Terraform v%s", version.String())
 		if !strings.Contains(stdout, wantVersion) {
 			t.Errorf("output does not contain our current version %q:\n%s", wantVersion, stdout)
 		}
@@ -88,7 +88,7 @@ func TestVersionWithProvider(t *testing.T) {
 			t.Errorf("unexpected stderr output:\n%s", stderr)
 		}
 
-		wantMsg := "+ provider.template v" // we don't know which version we'll get here
+		wantMsg := "+ provider registry.terraform.io/hashicorp/template v" // we don't know which version we'll get here
 		if !strings.Contains(stdout, wantMsg) {
 			t.Errorf("output does not contain provider information %q:\n%s", wantMsg, stdout)
 		}

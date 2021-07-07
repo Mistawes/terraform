@@ -1,36 +1,41 @@
 package command
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	plugin "github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/hashicorp/terraform-svchost/disco"
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/backend/local"
+	"github.com/hashicorp/terraform/command/arguments"
 	"github.com/hashicorp/terraform/command/format"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
-	"github.com/hashicorp/terraform/helper/experiment"
-	"github.com/hashicorp/terraform/helper/variables"
-	"github.com/hashicorp/terraform/helper/wrappedstreams"
-	"github.com/hashicorp/terraform/svchost/auth"
-	"github.com/hashicorp/terraform/svchost/disco"
+	"github.com/hashicorp/terraform/command/views"
+	"github.com/hashicorp/terraform/command/webbrowser"
+	"github.com/hashicorp/terraform/configs/configload"
+	"github.com/hashicorp/terraform/internal/getproviders"
+	"github.com/hashicorp/terraform/internal/terminal"
+	"github.com/hashicorp/terraform/providers"
+	"github.com/hashicorp/terraform/provisioners"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/mitchellh/cli"
 	"github.com/mitchellh/colorstring"
+
+	legacy "github.com/hashicorp/terraform/internal/legacy/terraform"
 )
 
 // Meta are the meta-options that are available on all or most commands.
@@ -39,21 +44,35 @@ type Meta struct {
 	// command with a Meta field. These are expected to be set externally
 	// (not from within the command itself).
 
-	Color            bool             // True if output should be colored
-	GlobalPluginDirs []string         // Additional paths to search for plugins
-	PluginOverrides  *PluginOverrides // legacy overrides from .terraformrc file
-	Ui               cli.Ui           // Ui for output
+	// OriginalWorkingDir, if set, is the actual working directory where
+	// Terraform was run from. This might not be the _actual_ current working
+	// directory, because users can add the -chdir=... option to the beginning
+	// of their command line to ask Terraform to switch.
+	//
+	// Most things should just use the current working directory in order to
+	// respect the user's override, but we retain this for exceptional
+	// situations where we need to refer back to the original working directory
+	// for some reason.
+	OriginalWorkingDir string
 
-	// ExtraHooks are extra hooks to add to the context.
-	ExtraHooks []terraform.Hook
+	// Streams tracks the raw Stdout, Stderr, and Stdin handles along with
+	// some basic metadata about them, such as whether each is connected to
+	// a terminal, how wide the possible terminal is, etc.
+	//
+	// For historical reasons this might not be set in unit test code, and
+	// so functions working with this field must check if it's nil and
+	// do some default behavior instead if so, rather than panicking.
+	Streams *terminal.Streams
+
+	View *views.View
+
+	Color            bool     // True if output should be colored
+	GlobalPluginDirs []string // Additional paths to search for plugins
+	Ui               cli.Ui   // Ui for output
 
 	// Services provides access to remote endpoint information for
 	// "terraform-native' services running at a specific user-facing hostname.
 	Services *disco.Disco
-
-	// Credentials provides access to credentials for "terraform-native"
-	// services, which are accessed by a service hostname.
-	Credentials auth.CredentialsSource
 
 	// RunningInAutomation indicates that commands are being run by an
 	// automated system rather than directly at a command prompt.
@@ -68,17 +87,51 @@ type Meta struct {
 	// the specific commands being run.
 	RunningInAutomation bool
 
+	// CLIConfigDir is the directory from which CLI configuration files were
+	// read by the caller and the directory where any changes to CLI
+	// configuration files by commands should be made.
+	//
+	// If this is empty then no configuration directory is available and
+	// commands which require one cannot proceed.
+	CLIConfigDir string
+
 	// PluginCacheDir, if non-empty, enables caching of downloaded plugins
 	// into the given directory.
 	PluginCacheDir string
+
+	// ProviderSource allows determining the available versions of a provider
+	// and determines where a distribution package for a particular
+	// provider version can be obtained.
+	ProviderSource getproviders.Source
 
 	// OverrideDataDir, if non-empty, overrides the return value of the
 	// DataDir method for situations where the local .terraform/ directory
 	// is not suitable, e.g. because of a read-only filesystem.
 	OverrideDataDir string
 
+	// BrowserLauncher is used by commands that need to open a URL in a
+	// web browser.
+	BrowserLauncher webbrowser.Launcher
+
 	// When this channel is closed, the command will be cancelled.
 	ShutdownCh <-chan struct{}
+
+	// ProviderDevOverrides are providers where we ignore the lock file, the
+	// configured version constraints, and the local cache directory and just
+	// always use exactly the path specified. This is intended to allow
+	// provider developers to easily test local builds without worrying about
+	// what version number they might eventually be released as, or what
+	// checksums they have.
+	ProviderDevOverrides map[addrs.Provider]getproviders.PackageLocalDir
+
+	// UnmanagedProviders are a set of providers that exist as processes
+	// predating Terraform, which Terraform should use but not worry about the
+	// lifecycle of.
+	//
+	// This is essentially a more extreme version of ProviderDevOverrides where
+	// Terraform doesn't even worry about how the provider server gets launched,
+	// just trusting that someone else did it before running Terraform.
+	UnmanagedProviders map[addrs.Provider]*plugin.ReattachConfig
 
 	//----------------------------------------------------------
 	// Protected: commands can set these
@@ -94,8 +147,6 @@ type Meta struct {
 	// This overrides all other search paths when discovering plugins.
 	pluginPath []string
 
-	ignorePluginChecksum bool
-
 	// Override certain behavior for tests within this package
 	testingOverrides *testingOverrides
 
@@ -103,17 +154,21 @@ type Meta struct {
 	// Private: do not set these
 	//----------------------------------------------------------
 
+	// configLoader is a shared configuration loader that is used by
+	// LoadConfig and other commands that access configuration files.
+	// It is initialized on first use.
+	configLoader *configload.Loader
+
 	// backendState is the currently active backend state
-	backendState *terraform.BackendState
+	backendState *legacy.BackendState
 
 	// Variables for the context (private)
-	autoKey       string
-	autoVariables map[string]interface{}
-	input         bool
-	variables     map[string]interface{}
+	variableArgs rawFlags
+	input        bool
 
 	// Targets for this context (private)
-	targets []string
+	targets     []addrs.Targetable
+	targetFlags []string
 
 	// Internal fields
 	color bool
@@ -129,15 +184,13 @@ type Meta struct {
 	//
 	// stateOutPath is used to override the output path for the state.
 	// If not provided, the StatePath is used causing the old state to
-	// be overriden.
+	// be overridden.
 	//
 	// backupPath is used to backup the state file before writing a modified
 	// version. It defaults to stateOutPath + DefaultBackupExtension
 	//
 	// parallelism is used to control the number of concurrent operations
 	// allowed when walking the graph
-	//
-	// shadow is used to enable/disable the shadow graph
 	//
 	// provider is to specify specific resource providers
 	//
@@ -150,29 +203,30 @@ type Meta struct {
 	// init.
 	//
 	// reconfigure forces init to ignore any stored configuration.
+	//
+	// compactWarnings (-compact-warnings) selects a more compact presentation
+	// of warnings in the output when they are not accompanied by errors.
 	statePath        string
 	stateOutPath     string
 	backupPath       string
 	parallelism      int
-	shadow           bool
-	provider         string
 	stateLock        bool
 	stateLockTimeout time.Duration
 	forceInitCopy    bool
 	reconfigure      bool
+	compactWarnings  bool
 
 	// Used with the import command to allow import of state when no matching config exists.
 	allowMissingConfig bool
-}
 
-type PluginOverrides struct {
-	Providers    map[string]string
-	Provisioners map[string]string
+	// Used with commands which write state to allow users to write remote
+	// state even if the remote and local Terraform versions don't match.
+	ignoreRemoteVersion bool
 }
 
 type testingOverrides struct {
-	ProviderResolver terraform.ResourceProviderResolver
-	Provisioners     map[string]terraform.ResourceProvisionerFactory
+	Providers    map[addrs.Provider]providers.Factory
+	Provisioners map[string]provisioners.Factory
 }
 
 // initStatePaths is used to initialize the default values for
@@ -236,8 +290,6 @@ func (m *Meta) InputMode() terraform.InputMode {
 
 	var mode terraform.InputMode
 	mode |= terraform.InputModeProvider
-	mode |= terraform.InputModeVar
-	mode |= terraform.InputModeVarUnset
 
 	return mode
 }
@@ -249,18 +301,88 @@ func (m *Meta) UIInput() terraform.UIInput {
 	}
 }
 
-// StdinPiped returns true if the input is piped.
-func (m *Meta) StdinPiped() bool {
-	fi, err := wrappedstreams.Stdin().Stat()
-	if err != nil {
-		// If there is an error, let's just say its not piped
-		return false
+// OutputColumns returns the number of columns that normal (non-error) UI
+// output should be wrapped to fill.
+//
+// This is the column count to use if you'll be printing your message via
+// the Output or Info methods of m.Ui.
+func (m *Meta) OutputColumns() int {
+	if m.Streams == nil {
+		// A default for unit tests that don't populate Meta fully.
+		return 78
 	}
-
-	return fi.Mode()&os.ModeNamedPipe != 0
+	return m.Streams.Stdout.Columns()
 }
 
+// ErrorColumns returns the number of columns that error UI output should be
+// wrapped to fill.
+//
+// This is the column count to use if you'll be printing your message via
+// the Error or Warn methods of m.Ui.
+func (m *Meta) ErrorColumns() int {
+	if m.Streams == nil {
+		// A default for unit tests that don't populate Meta fully.
+		return 78
+	}
+	return m.Streams.Stderr.Columns()
+}
+
+// StdinPiped returns true if the input is piped.
+func (m *Meta) StdinPiped() bool {
+	if m.Streams == nil {
+		// If we don't have m.Streams populated then we're presumably in a unit
+		// test that doesn't properly populate Meta, so we'll just say the
+		// output _isn't_ piped because that's the common case and so most likely
+		// to be useful to a unit test.
+		return false
+	}
+	return !m.Streams.Stdin.IsTerminal()
+}
+
+// InterruptibleContext returns a context.Context that will be cancelled
+// if the process is interrupted by a platform-specific interrupt signal.
+//
+// As usual with cancelable contexts, the caller must always call the given
+// cancel function once all operations are complete in order to make sure
+// that the context resources will still be freed even if there is no
+// interruption.
+func (m *Meta) InterruptibleContext() (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if m.ShutdownCh == nil {
+		// If we're running in a unit testing context without a shutdown
+		// channel populated then we'll return an uncancelable channel.
+		return base, func() {}
+	}
+
+	ctx, cancel := context.WithCancel(base)
+	go func() {
+		select {
+		case <-m.ShutdownCh:
+			cancel()
+		case <-ctx.Done():
+			// finished without being interrupted
+		}
+	}()
+	return ctx, cancel
+}
+
+// RunOperation executes the given operation on the given backend, blocking
+// until that operation completes or is interrupted, and then returns
+// the RunningOperation object representing the completed or
+// aborted operation that is, despite the name, no longer running.
+//
+// An error is returned if the operation either fails to start or is cancelled.
+// If the operation runs to completion then no error is returned even if the
+// operation itself is unsuccessful. Use the "Result" field of the
+// returned operation object to recognize operation-level failure.
 func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*backend.RunningOperation, error) {
+	if opReq.View == nil {
+		panic("RunOperation called with nil View")
+	}
+	if opReq.ConfigDir != "" {
+		opReq.ConfigDir = m.normalizePath(opReq.ConfigDir)
+	}
+
 	op, err := b.Operation(context.Background(), opReq)
 	if err != nil {
 		return nil, fmt.Errorf("error starting operation: %s", err)
@@ -273,14 +395,12 @@ func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*back
 		op.Stop()
 
 		// Notify the user
-		m.Ui.Output(outputInterrupt)
+		opReq.View.Interrupted()
 
 		// Still get the result, since there is still one
 		select {
 		case <-m.ShutdownCh:
-			m.Ui.Error(
-				"Two interrupts received. Exiting immediately. Note that data\n" +
-					"loss may have occurred.")
+			opReq.View.FatalInterrupt()
 
 			// cancel the operation completely
 			op.Cancel()
@@ -301,127 +421,171 @@ func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*back
 		// operation completed normally
 	}
 
-	if op.Err != nil {
-		return op, op.Err
-	}
-
 	return op, nil
 }
 
-const (
-	ProviderSkipVerifyEnvVar = "TF_SKIP_PROVIDER_VERIFY"
-)
-
 // contextOpts returns the options to use to initialize a Terraform
 // context with the settings from this Meta.
-func (m *Meta) contextOpts() *terraform.ContextOpts {
-	var opts terraform.ContextOpts
-	opts.Hooks = []terraform.Hook{m.uiHook(), &terraform.DebugHook{}}
-	opts.Hooks = append(opts.Hooks, m.ExtraHooks...)
+func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
+	workspace, err := m.Workspace()
+	if err != nil {
+		return nil, err
+	}
 
-	vs := make(map[string]interface{})
-	for k, v := range opts.Variables {
-		vs[k] = v
-	}
-	for k, v := range m.autoVariables {
-		vs[k] = v
-	}
-	for k, v := range m.variables {
-		vs[k] = v
-	}
-	opts.Variables = vs
+	var opts terraform.ContextOpts
 
 	opts.Targets = m.targets
 	opts.UIInput = m.UIInput()
 	opts.Parallelism = m.parallelism
-	opts.Shadow = m.shadow
 
 	// If testingOverrides are set, we'll skip the plugin discovery process
 	// and just work with what we've been given, thus allowing the tests
 	// to provide mock providers and provisioners.
 	if m.testingOverrides != nil {
-		opts.ProviderResolver = m.testingOverrides.ProviderResolver
+		opts.Providers = m.testingOverrides.Providers
 		opts.Provisioners = m.testingOverrides.Provisioners
 	} else {
-		opts.ProviderResolver = m.providerResolver()
+		providerFactories, err := m.providerFactories()
+		if err != nil {
+			// providerFactories can fail if the plugin selections file is
+			// invalid in some way, but we don't have any way to report that
+			// from here so we'll just behave as if no providers are available
+			// in that case. However, we will produce a warning in case this
+			// shows up unexpectedly and prompts a bug report.
+			// This situation shouldn't arise commonly in practice because
+			// the selections file is generated programmatically.
+			log.Printf("[WARN] Failed to determine selected providers: %s", err)
+
+			// variable providerFactories may now be incomplete, which could
+			// lead to errors reported downstream from here. providerFactories
+			// tries to populate as many providers as possible even in an
+			// error case, so that operations not using problematic providers
+			// can still succeed.
+		}
+		opts.Providers = providerFactories
 		opts.Provisioners = m.provisionerFactories()
+
+		// Read the dependency locks so that they can be verified against the
+		// provider requirements in the configuration
+		lockedDependencies, diags := m.lockedDependencies()
+
+		// If the locks file is invalid, we should fail early rather than
+		// ignore it. A missing locks file will return no error.
+		if diags.HasErrors() {
+			return nil, diags.Err()
+		}
+		opts.LockedDependencies = lockedDependencies
+
+		// If any unmanaged providers or dev overrides are enabled, they must
+		// be listed in the context so that they can be ignored when verifying
+		// the locks against the configuration
+		opts.ProvidersInDevelopment = make(map[addrs.Provider]struct{})
+		for provider := range m.UnmanagedProviders {
+			opts.ProvidersInDevelopment[provider] = struct{}{}
+		}
+		for provider := range m.ProviderDevOverrides {
+			opts.ProvidersInDevelopment[provider] = struct{}{}
+		}
 	}
 
 	opts.ProviderSHA256s = m.providerPluginsLock().Read()
-	if v := os.Getenv(ProviderSkipVerifyEnvVar); v != "" {
-		opts.SkipProviderVerify = true
-	}
 
 	opts.Meta = &terraform.ContextMeta{
-		Env: m.Workspace(),
+		Env:                workspace,
+		OriginalWorkingDir: m.OriginalWorkingDir,
 	}
 
-	return &opts
+	return &opts, nil
 }
 
-// flags adds the meta flags to the given FlagSet.
-func (m *Meta) flagSet(n string) *flag.FlagSet {
+// defaultFlagSet creates a default flag set for commands.
+// See also command/arguments/default.go
+func (m *Meta) defaultFlagSet(n string) *flag.FlagSet {
 	f := flag.NewFlagSet(n, flag.ContinueOnError)
-	f.BoolVar(&m.input, "input", true, "input")
-	f.Var((*variables.Flag)(&m.variables), "var", "variables")
-	f.Var((*variables.FlagFile)(&m.variables), "var-file", "variable file")
-	f.Var((*FlagStringSlice)(&m.targets), "target", "resource to target")
-
-	if m.autoKey != "" {
-		f.Var((*variables.FlagFile)(&m.autoVariables), m.autoKey, "variable file")
-	}
-
-	// Advanced (don't need documentation, or unlikely to be set)
-	f.BoolVar(&m.shadow, "shadow", true, "shadow graph")
-
-	// Experimental features
-	experiment.Flag(f)
-
-	// Create an io.Writer that writes to our Ui properly for errors.
-	// This is kind of a hack, but it does the job. Basically: create
-	// a pipe, use a scanner to break it into lines, and output each line
-	// to the UI. Do this forever.
-	errR, errW := io.Pipe()
-	errScanner := bufio.NewScanner(errR)
-	go func() {
-		// This only needs to be alive long enough to write the help info if
-		// there is a flag error. Kill the scanner after a short duriation to
-		// prevent these from accumulating during tests, and cluttering up the
-		// stack traces.
-		time.AfterFunc(2*time.Second, func() {
-			errW.Close()
-		})
-		for errScanner.Scan() {
-			m.Ui.Error(errScanner.Text())
-		}
-	}()
-	f.SetOutput(errW)
+	f.SetOutput(ioutil.Discard)
 
 	// Set the default Usage to empty
 	f.Usage = func() {}
 
-	// command that bypass locking will supply their own flag on this var, but
-	// set the initial meta value to true as a failsafe.
+	return f
+}
+
+// ignoreRemoteVersionFlagSet add the ignore-remote version flag to suppress
+// the error when the configured Terraform version on the remote workspace
+// does not match the local Terraform version.
+func (m *Meta) ignoreRemoteVersionFlagSet(n string) *flag.FlagSet {
+	f := m.defaultFlagSet(n)
+
+	f.BoolVar(&m.ignoreRemoteVersion, "ignore-remote-version", false, "continue even if remote and local Terraform versions are incompatible")
+
+	return f
+}
+
+// extendedFlagSet adds custom flags that are mostly used by commands
+// that are used to run an operation like plan or apply.
+func (m *Meta) extendedFlagSet(n string) *flag.FlagSet {
+	f := m.defaultFlagSet(n)
+
+	f.BoolVar(&m.input, "input", true, "input")
+	f.Var((*FlagStringSlice)(&m.targetFlags), "target", "resource to target")
+	f.BoolVar(&m.compactWarnings, "compact-warnings", false, "use compact warnings")
+
+	if m.variableArgs.items == nil {
+		m.variableArgs = newRawFlags("-var")
+	}
+	varValues := m.variableArgs.Alias("-var")
+	varFiles := m.variableArgs.Alias("-var-file")
+	f.Var(varValues, "var", "variables")
+	f.Var(varFiles, "var-file", "variable file")
+
+	// commands that bypass locking will supply their own flag on this var,
+	// but set the initial meta value to true as a failsafe.
 	m.stateLock = true
 
 	return f
 }
 
-// moduleStorage returns the module.Storage implementation used to store
-// modules for commands.
-func (m *Meta) moduleStorage(root string, mode module.GetMode) *module.Storage {
-	s := module.NewStorage(filepath.Join(root, "modules"), m.Services, m.Credentials)
-	s.Ui = m.Ui
-	s.Mode = mode
-	return s
+// parseTargetFlags must be called for any commands supporting -target
+// arguments. This method attempts to parse each -target flag into an
+// addrs.Target, storing in the Meta.targets slice.
+//
+// If any flags cannot be parsed, we rewrap the first error diagnostic with a
+// custom title to clarify the source of the error. The normal approach of
+// directly returning the diags from HCL or the addrs package results in
+// confusing incorrect "source" results when presented.
+func (m *Meta) parseTargetFlags() tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	m.targets = nil
+	for _, tf := range m.targetFlags {
+		traversal, syntaxDiags := hclsyntax.ParseTraversalAbs([]byte(tf), "", hcl.Pos{Line: 1, Column: 1})
+		if syntaxDiags.HasErrors() {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Invalid target %q", tf),
+				syntaxDiags[0].Detail,
+			))
+			continue
+		}
+
+		target, targetDiags := addrs.ParseTarget(traversal)
+		if targetDiags.HasErrors() {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Invalid target %q", tf),
+				targetDiags[0].Description().Detail,
+			))
+			continue
+		}
+
+		m.targets = append(m.targets, target.Subject)
+	}
+	return diags
 }
 
-// process will process the meta-parameters out of the arguments. This
+// process will process any -no-color entries out of the arguments. This
 // will potentially modify the args in-place. It will return the resulting
-// slice.
-//
-// vars says whether or not we support variables.
-func (m *Meta) process(args []string, vars bool) ([]string, error) {
+// slice, and update the Meta and Ui.
+func (m *Meta) process(args []string) []string {
 	// We do this so that we retain the ability to technically call
 	// process multiple times, even if we have no plans to do so
 	if m.oldUi != nil {
@@ -430,14 +594,18 @@ func (m *Meta) process(args []string, vars bool) ([]string, error) {
 
 	// Set colorization
 	m.color = m.Color
-	for i, v := range args {
+	i := 0 // output index
+	for _, v := range args {
 		if v == "-no-color" {
 			m.color = false
 			m.Color = false
-			args = append(args[:i], args[i+1:]...)
-			break
+		} else {
+			// copy and increment index
+			args[i] = v
+			i++
 		}
 	}
+	args = args[:i]
 
 	// Set the UI
 	m.oldUi = m.Ui
@@ -450,60 +618,21 @@ func (m *Meta) process(args []string, vars bool) ([]string, error) {
 		},
 	}
 
-	// If we support vars and the default var file exists, add it to
-	// the args...
-	m.autoKey = ""
-	if vars {
-		var preArgs []string
-
-		if _, err := os.Stat(DefaultVarsFilename); err == nil {
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, DefaultVarsFilename)
-		}
-
-		if _, err := os.Stat(DefaultVarsFilename + ".json"); err == nil {
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, DefaultVarsFilename+".json")
-		}
-
-		wd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-
-		fis, err := ioutil.ReadDir(wd)
-		if err != nil {
-			return nil, err
-		}
-
-		// make sure we add the files in order
-		sort.Slice(fis, func(i, j int) bool {
-			return fis[i].Name() < fis[j].Name()
+	// Reconfigure the view. This is necessary for commands which use both
+	// views.View and cli.Ui during the migration phase.
+	if m.View != nil {
+		m.View.Configure(&arguments.View{
+			CompactWarnings: m.compactWarnings,
+			NoColor:         !m.Color,
 		})
-
-		for _, fi := range fis {
-			name := fi.Name()
-			// Ignore directories, non-var-files, and ignored files
-			if fi.IsDir() || !isAutoVarFile(name) || config.IsIgnoredFile(name) {
-				continue
-			}
-
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, name)
-		}
-
-		args = append(preArgs, args...)
 	}
 
-	return args, nil
+	return args
 }
 
 // uiHook returns the UiHook to use with the context.
-func (m *Meta) uiHook() *UiHook {
-	return &UiHook{
-		Colorize: m.Colorize(),
-		Ui:       m.Ui,
-	}
+func (m *Meta) uiHook() *views.UiHook {
+	return views.NewUiHook(m.View)
 }
 
 // confirm asks a yes/no confirmation.
@@ -513,7 +642,7 @@ func (m *Meta) confirm(opts *terraform.InputOpts) (bool, error) {
 	}
 
 	for i := 0; i < 2; i++ {
-		v, err := m.UIInput().Input(opts)
+		v, err := m.UIInput().Input(context.Background(), opts)
 		if err != nil {
 			return false, fmt.Errorf(
 				"Error asking for confirmation: %s", err)
@@ -541,13 +670,46 @@ func (m *Meta) confirm(opts *terraform.InputOpts) (bool, error) {
 func (m *Meta) showDiagnostics(vals ...interface{}) {
 	var diags tfdiags.Diagnostics
 	diags = diags.Append(vals...)
+	diags.Sort()
+
+	if len(diags) == 0 {
+		return
+	}
+
+	outputWidth := m.ErrorColumns()
+
+	diags = diags.ConsolidateWarnings(1)
+
+	// Since warning messages are generally competing
+	if m.compactWarnings {
+		// If the user selected compact warnings and all of the diagnostics are
+		// warnings then we'll use a more compact representation of the warnings
+		// that only includes their summaries.
+		// We show full warnings if there are also errors, because a warning
+		// can sometimes serve as good context for a subsequent error.
+		useCompact := true
+		for _, diag := range diags {
+			if diag.Severity() != tfdiags.Warning {
+				useCompact = false
+				break
+			}
+		}
+		if useCompact {
+			msg := format.DiagnosticWarningsCompact(diags, m.Colorize())
+			msg = "\n" + msg + "\nTo see the full warning notes, run Terraform without -compact-warnings.\n"
+			m.Ui.Warn(msg)
+			return
+		}
+	}
 
 	for _, diag := range diags {
-		// TODO: Actually measure the terminal width and pass it here.
-		// For now, we don't have easy access to the writer that
-		// ui.Error (etc) are writing to and thus can't interrogate
-		// to see if it's a terminal and what size it is.
-		msg := format.Diagnostic(diag, m.Colorize(), 78)
+		var msg string
+		if m.Color {
+			msg = format.Diagnostic(diag, m.configSources(), m.Colorize(), outputWidth)
+		} else {
+			msg = format.DiagnosticPlain(diag, m.configSources(), outputWidth)
+		}
+
 		switch diag.Severity() {
 		case tfdiags.Error:
 			m.Ui.Error(msg)
@@ -559,68 +721,6 @@ func (m *Meta) showDiagnostics(vals ...interface{}) {
 	}
 }
 
-const (
-	// ModuleDepthDefault is the default value for
-	// module depth, which can be overridden by flag
-	// or env var
-	ModuleDepthDefault = -1
-
-	// ModuleDepthEnvVar is the name of the environment variable that can be used to set module depth.
-	ModuleDepthEnvVar = "TF_MODULE_DEPTH"
-)
-
-func (m *Meta) addModuleDepthFlag(flags *flag.FlagSet, moduleDepth *int) {
-	flags.IntVar(moduleDepth, "module-depth", ModuleDepthDefault, "module-depth")
-	if envVar := os.Getenv(ModuleDepthEnvVar); envVar != "" {
-		if md, err := strconv.Atoi(envVar); err == nil {
-			*moduleDepth = md
-		}
-	}
-}
-
-// outputShadowError outputs the error from ctx.ShadowError. If the
-// error is nil then nothing happens. If output is false then it isn't
-// outputted to the user (you can define logic to guard against outputting).
-func (m *Meta) outputShadowError(err error, output bool) bool {
-	// Do nothing if no error
-	if err == nil {
-		return false
-	}
-
-	// If not outputting, do nothing
-	if !output {
-		return false
-	}
-
-	// Write the shadow error output to a file
-	path := fmt.Sprintf("terraform-error-%d.log", time.Now().UTC().Unix())
-	if err := ioutil.WriteFile(path, []byte(err.Error()), 0644); err != nil {
-		// If there is an error writing it, just let it go
-		log.Printf("[ERROR] Error writing shadow error: %s", err)
-		return false
-	}
-
-	// Output!
-	m.Ui.Output(m.Colorize().Color(fmt.Sprintf(
-		"[reset][bold][yellow]\nExperimental feature failure! Please report a bug.\n\n"+
-			"This is not an error. Your Terraform operation completed successfully.\n"+
-			"Your real infrastructure is unaffected by this message.\n\n"+
-			"[reset][yellow]While running, Terraform sometimes tests experimental features in the\n"+
-			"background. These features cannot affect real state and never touch\n"+
-			"real infrastructure. If the features work properly, you see nothing.\n"+
-			"If the features fail, this message appears.\n\n"+
-			"You can report an issue at: https://github.com/hashicorp/terraform/issues\n\n"+
-			"The failure was written to %q. Please\n"+
-			"double check this file contains no sensitive information and report\n"+
-			"it with your issue.\n\n"+
-			"This is not an error. Your terraform operation completed successfully\n"+
-			"and your real infrastructure is unaffected by this message.",
-		path,
-	)))
-
-	return true
-}
-
 // WorkspaceNameEnvVar is the name of the environment variable that can be used
 // to set the name of the Terraform workspace, overriding the workspace chosen
 // by `terraform workspace select`.
@@ -629,11 +729,16 @@ func (m *Meta) outputShadowError(err error, output bool) bool {
 // and `terraform workspace delete`.
 const WorkspaceNameEnvVar = "TF_WORKSPACE"
 
+var errInvalidWorkspaceNameEnvVar = fmt.Errorf("Invalid workspace name set using %s", WorkspaceNameEnvVar)
+
 // Workspace returns the name of the currently configured workspace, corresponding
 // to the desired named state.
-func (m *Meta) Workspace() string {
-	current, _ := m.WorkspaceOverridden()
-	return current
+func (m *Meta) Workspace() (string, error) {
+	current, overridden := m.WorkspaceOverridden()
+	if overridden && !validWorkspaceName(current) {
+		return "", errInvalidWorkspaceNameEnvVar
+	}
+	return current, nil
 }
 
 // WorkspaceOverridden returns the name of the currently configured workspace,
@@ -677,4 +782,15 @@ func (m *Meta) SetWorkspace(name string) error {
 func isAutoVarFile(path string) bool {
 	return strings.HasSuffix(path, ".auto.tfvars") ||
 		strings.HasSuffix(path, ".auto.tfvars.json")
+}
+
+// FIXME: as an interim refactoring step, we apply the contents of the state
+// arguments directly to the Meta object. Future work would ideally update the
+// code paths which use these arguments to be passed them directly for clarity.
+func (m *Meta) applyStateArguments(args *arguments.State) {
+	m.stateLock = args.Lock
+	m.stateLockTimeout = args.LockTimeout
+	m.statePath = args.StatePath
+	m.stateOutPath = args.StateOutPath
+	m.backupPath = args.BackupPath
 }

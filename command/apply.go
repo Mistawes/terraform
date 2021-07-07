@@ -1,19 +1,14 @@
 package command
 
 import (
-	"bytes"
 	"fmt"
-	"os"
-	"sort"
 	"strings"
 
-	"github.com/hashicorp/terraform/tfdiags"
-
-	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/command/arguments"
+	"github.com/hashicorp/terraform/command/views"
+	"github.com/hashicorp/terraform/plans/planfile"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // ApplyCommand is a Command implementation that applies a Terraform
@@ -26,158 +21,278 @@ type ApplyCommand struct {
 	Destroy bool
 }
 
-func (c *ApplyCommand) Run(args []string) int {
-	var destroyForce, refresh, autoApprove bool
-	args, err := c.Meta.process(args, true)
-	if err != nil {
-		return 1
-	}
+func (c *ApplyCommand) Run(rawArgs []string) int {
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
 
-	cmdName := "apply"
-	if c.Destroy {
-		cmdName = "destroy"
-	}
+	// Parse and validate flags
+	args, diags := arguments.ParseApply(rawArgs)
 
-	cmdFlags := c.Meta.flagSet(cmdName)
-	cmdFlags.BoolVar(&autoApprove, "auto-approve", false, "skip interactive approval of plan before applying")
-	if c.Destroy {
-		cmdFlags.BoolVar(&destroyForce, "force", false, "deprecated: same as auto-approve")
-	}
-	cmdFlags.BoolVar(&refresh, "refresh", true, "refresh")
-	cmdFlags.IntVar(
-		&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
-	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
-	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
-	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
-	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
-	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		return 1
-	}
+	// Instantiate the view, even if there are flag errors, so that we render
+	// diagnostics according to the desired view
+	var view views.Apply
+	view = views.NewApply(args.ViewType, c.Destroy, c.RunningInAutomation, c.View)
 
-	// Get the args. The "maybeInit" flag tracks whether we may need to
-	// initialize the configuration from a remote path. This is true as long
-	// as we have an argument.
-	args = cmdFlags.Args()
-	maybeInit := len(args) == 1
-	configPath, err := ModulePath(args)
-	if err != nil {
-		c.Ui.Error(err.Error())
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		view.HelpPrompt()
 		return 1
 	}
 
 	// Check for user-supplied plugin path
+	var err error
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error loading plugin path: %s", err))
+		diags = diags.Append(err)
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	if !c.Destroy && maybeInit {
-		// We need the pwd for the getter operation below
-		pwd, err := os.Getwd()
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error getting pwd: %s", err))
-			return 1
-		}
-
-		// Do a detect to determine if we need to do an init + apply.
-		if detected, err := getter.Detect(configPath, pwd, getter.Detectors); err != nil {
-			c.Ui.Error(fmt.Sprintf(
-				"Invalid path: %s", err))
-			return 1
-		} else if !strings.HasPrefix(detected, "file") {
-			// If this isn't a file URL then we're doing an init +
-			// apply.
-			var init InitCommand
-			init.Meta = c.Meta
-			if code := init.Run([]string{detected}); code != 0 {
-				return code
-			}
-
-			// Change the config path to be the cwd
-			configPath = pwd
-		}
-	}
-
-	// Check if the path is a plan
-	plan, err := c.Plan(configPath)
-	if err != nil {
-		c.Ui.Error(err.Error())
-		return 1
-	}
-	if c.Destroy && plan != nil {
-		c.Ui.Error(fmt.Sprintf(
-			"Destroy can't be called with a plan file."))
-		return 1
-	}
-	if plan != nil {
-		// Reset the config path for backend loading
-		configPath = ""
-	}
-
-	var diags tfdiags.Diagnostics
-
-	// Load the module if we don't have one yet (not running from plan)
-	var mod *module.Tree
-	if plan == nil {
-		var modDiags tfdiags.Diagnostics
-		mod, modDiags = c.Module(configPath)
-		diags = diags.Append(modDiags)
-		if modDiags.HasErrors() {
-			c.showDiagnostics(diags)
-			return 1
-		}
-	}
-
-	var conf *config.Config
-	if mod != nil {
-		conf = mod.Config()
-	}
-
-	// Load the backend
-	b, err := c.Backend(&BackendOpts{
-		Config: conf,
-		Plan:   plan,
-	})
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+	// Attempt to load the plan file, if specified
+	planFile, diags := c.LoadPlanFile(args.PlanPath)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	// Build the operation
-	opReq := c.Operation()
-	opReq.Destroy = c.Destroy
-	opReq.Module = mod
-	opReq.Plan = plan
-	opReq.PlanRefresh = refresh
-	opReq.Type = backend.OperationTypeApply
-	opReq.AutoApprove = autoApprove
-	opReq.DestroyForce = destroyForce
+	// Check for invalid combination of plan file and variable overrides
+	if planFile != nil && !args.Vars.Empty() {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Can't set variables when applying a saved plan",
+			"The -var and -var-file options cannot be used when applying a saved plan file, because a saved plan includes the variable values that were set when it was created.",
+		))
+		view.Diagnostics(diags)
+		return 1
+	}
 
-	op, err := c.RunOperation(b, opReq)
+	// FIXME: the -input flag value is needed to initialize the backend and the
+	// operation, but there is no clear path to pass this value down, so we
+	// continue to mutate the Meta object state for now.
+	c.Meta.input = args.InputEnabled
+
+	// FIXME: the -parallelism flag is used to control the concurrency of
+	// Terraform operations. At the moment, this value is used both to
+	// initialize the backend via the ContextOpts field inside CLIOpts, and to
+	// set a largely unused field on the Operation request. Again, there is no
+	// clear path to pass this value down, so we continue to mutate the Meta
+	// object state for now.
+	c.Meta.parallelism = args.Operation.Parallelism
+
+	// Prepare the backend, passing the plan file if present, and the
+	// backend-specific arguments
+	be, beDiags := c.PrepareBackend(planFile, args.State)
+	diags = diags.Append(beDiags)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	// Build the operation request
+	opReq, opDiags := c.OperationRequest(be, view, planFile, args.Operation, args.AutoApprove)
+	diags = diags.Append(opDiags)
+
+	// Collect variable value and add them to the operation request
+	diags = diags.Append(c.GatherVariables(opReq, args.Vars))
+
+	// Before we delegate to the backend, we'll print any warning diagnostics
+	// we've accumulated here, since the backend will start fresh with its own
+	// diagnostics.
+	view.Diagnostics(diags)
+	if diags.HasErrors() {
+		return 1
+	}
+	diags = nil
+
+	// Run the operation
+	op, err := c.RunOperation(be, opReq)
 	if err != nil {
 		diags = diags.Append(err)
+		view.Diagnostics(diags)
+		return 1
 	}
 
-	c.showDiagnostics(diags)
+	if op.Result != backend.OperationSuccess {
+		return op.Result.ExitStatus()
+	}
+
+	// // Render the resource count and outputs
+	view.ResourceCount(args.State.StateOutPath)
+	if !c.Destroy && op.State != nil {
+		view.Outputs(op.State.RootModule().OutputValues)
+	}
+
+	view.Diagnostics(diags)
+
 	if diags.HasErrors() {
 		return 1
 	}
 
-	if !c.Destroy {
-		// Get the right module that we used. If we ran a plan, then use
-		// that module.
-		if plan != nil {
-			mod = plan.Module
+	return 0
+}
+
+func (c *ApplyCommand) LoadPlanFile(path string) (*planfile.Reader, tfdiags.Diagnostics) {
+	var planFile *planfile.Reader
+	var diags tfdiags.Diagnostics
+
+	// Try to load plan if path is specified
+	if path != "" {
+		var err error
+		planFile, err = c.PlanFile(path)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Failed to load %q as a plan file", path),
+				fmt.Sprintf("Error: %s", err),
+			))
+			return nil, diags
 		}
 
-		if outputs := outputsAsString(op.State, terraform.RootModulePath, mod.Config().Outputs, true); outputs != "" {
-			c.Ui.Output(c.Colorize().Color(outputs))
+		// If the path doesn't look like a plan, both planFile and err will be
+		// nil. In that case, the user is probably trying to use the positional
+		// argument to specify a configuration path. Point them at -chdir.
+		if planFile == nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Failed to load %q as a plan file", path),
+				"The specified path is a directory, not a plan file. You can use the global -chdir flag to use this directory as the configuration root.",
+			))
+			return nil, diags
+		}
+
+		// If we successfully loaded a plan but this is a destroy operation,
+		// explain that this is not supported.
+		if c.Destroy {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Destroy can't be called with a plan file",
+				fmt.Sprintf("If this plan was created using plan -destroy, apply it using:\n  terraform apply %q", path),
+			))
+			return nil, diags
 		}
 	}
 
-	return 0
+	return planFile, diags
+}
+
+func (c *ApplyCommand) PrepareBackend(planFile *planfile.Reader, args *arguments.State) (backend.Enhanced, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	// FIXME: we need to apply the state arguments to the meta object here
+	// because they are later used when initializing the backend. Carving a
+	// path to pass these arguments to the functions that need them is
+	// difficult but would make their use easier to understand.
+	c.Meta.applyStateArguments(args)
+
+	// Load the backend
+	var be backend.Enhanced
+	var beDiags tfdiags.Diagnostics
+	if planFile == nil {
+		backendConfig, configDiags := c.loadBackendConfig(".")
+		diags = diags.Append(configDiags)
+		if configDiags.HasErrors() {
+			return nil, diags
+		}
+
+		be, beDiags = c.Backend(&BackendOpts{
+			Config: backendConfig,
+		})
+	} else {
+		plan, err := planFile.ReadPlan()
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to read plan from plan file",
+				fmt.Sprintf("Cannot read the plan from the given plan file: %s.", err),
+			))
+			return nil, diags
+		}
+		if plan.Backend.Config == nil {
+			// Should never happen; always indicates a bug in the creation of the plan file
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to read plan from plan file",
+				"The given plan file does not have a valid backend configuration. This is a bug in the Terraform command that generated this plan file.",
+			))
+			return nil, diags
+		}
+		be, beDiags = c.BackendForPlan(plan.Backend)
+	}
+
+	diags = diags.Append(beDiags)
+	if beDiags.HasErrors() {
+		return nil, diags
+	}
+	return be, diags
+}
+
+func (c *ApplyCommand) OperationRequest(
+	be backend.Enhanced,
+	view views.Apply,
+	planFile *planfile.Reader,
+	args *arguments.Operation,
+	autoApprove bool,
+) (*backend.Operation, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	// Applying changes with dev overrides in effect could make it impossible
+	// to switch back to a release version if the schema isn't compatible,
+	// so we'll warn about it.
+	diags = diags.Append(c.providerDevOverrideRuntimeWarnings())
+
+	// Build the operation
+	opReq := c.Operation(be)
+	opReq.AutoApprove = autoApprove
+	opReq.ConfigDir = "."
+	opReq.Destroy = c.Destroy
+	opReq.Hooks = view.Hooks()
+	opReq.PlanFile = planFile
+	opReq.PlanRefresh = args.Refresh
+	opReq.Targets = args.Targets
+	opReq.Type = backend.OperationTypeApply
+	opReq.View = view.Operation()
+
+	// FIXME: To allow errors to be easily rendered, the showDiagnostics method
+	// accepts ...interface{}. The backend no longer needs this, as only
+	// tfdiags.Diagnostics values are used. Once we have migrated plan and refresh
+	// to use views, we can remove ShowDiagnostics and update the backend code to
+	// call view.Diagnostics() instead.
+	opReq.ShowDiagnostics = func(vals ...interface{}) {
+		var diags tfdiags.Diagnostics
+		diags = diags.Append(vals...)
+		view.Diagnostics(diags)
+	}
+
+	var err error
+	opReq.ConfigLoader, err = c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
+		return nil, diags
+	}
+
+	return opReq, diags
+}
+
+func (c *ApplyCommand) GatherVariables(opReq *backend.Operation, args *arguments.Vars) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	// FIXME the arguments package currently trivially gathers variable related
+	// arguments in a heterogenous slice, in order to minimize the number of
+	// code paths gathering variables during the transition to this structure.
+	// Once all commands that gather variables have been converted to this
+	// structure, we could move the variable gathering code to the arguments
+	// package directly, removing this shim layer.
+
+	varArgs := args.All()
+	items := make([]rawFlag, len(varArgs))
+	for i := range varArgs {
+		items[i].Name = varArgs[i].Name
+		items[i].Value = varArgs[i].Value
+	}
+	c.Meta.variableArgs = rawFlags{items: &items}
+	opReq.Variables, diags = c.collectVariableValues()
+
+	return diags
 }
 
 func (c *ApplyCommand) Help() string {
@@ -190,31 +305,36 @@ func (c *ApplyCommand) Help() string {
 
 func (c *ApplyCommand) Synopsis() string {
 	if c.Destroy {
-		return "Destroy Terraform-managed infrastructure"
+		return "Destroy previously-created infrastructure"
 	}
 
-	return "Builds or changes infrastructure"
+	return "Create or update infrastructure"
 }
 
 func (c *ApplyCommand) helpApply() string {
 	helpText := `
-Usage: terraform apply [options] [DIR-OR-PLAN]
+Usage: terraform [global options] apply [options] [PLAN]
 
-  Builds or changes infrastructure according to Terraform configuration
-  files in DIR.
+  Creates or updates infrastructure according to Terraform configuration
+  files in the current directory.
 
-  By default, apply scans the current directory for the configuration
-  and applies the changes appropriately. However, a path to another
-  configuration or an execution plan can be provided. Execution plans can be
-  used to only execute a pre-determined set of actions.
+  By default, Terraform will generate a new plan and present it for your
+  approval before taking any action. You can optionally provide a plan
+  file created by a previous call to "terraform plan", in which case
+  Terraform will take the actions described in that plan without any
+  confirmation prompt.
 
 Options:
+
+  -auto-approve          Skip interactive approval of plan before applying.
 
   -backup=path           Path to backup the existing state file before
                          modifying. Defaults to the "-state-out" path with
                          ".backup" extension. Set to "-" to disable backup.
 
-  -auto-approve          Skip interactive approval of plan before applying.
+  -compact-warnings      If Terraform produces any warnings that are not
+                         accompanied by errors, show them in a more compact
+                         form that includes only the summary messages.
 
   -lock=true             Lock the state file when locking is supported.
 
@@ -255,7 +375,7 @@ Options:
 
 func (c *ApplyCommand) helpDestroy() string {
 	helpText := `
-Usage: terraform destroy [options] [DIR]
+Usage: terraform [global options] destroy [options]
 
   Destroy Terraform-managed infrastructure.
 
@@ -266,8 +386,6 @@ Options:
                          ".backup" extension. Set to "-" to disable backup.
 
   -auto-approve          Skip interactive approval before destroying.
-
-  -force                 Deprecated: same as auto-approve.
 
   -lock=true             Lock the state file when locking is supported.
 
@@ -303,66 +421,3 @@ Options:
 `
 	return strings.TrimSpace(helpText)
 }
-
-func outputsAsString(state *terraform.State, modPath []string, schema []*config.Output, includeHeader bool) string {
-	if state == nil {
-		return ""
-	}
-
-	ms := state.ModuleByPath(modPath)
-	if ms == nil {
-		return ""
-	}
-
-	outputs := ms.Outputs
-	outputBuf := new(bytes.Buffer)
-	if len(outputs) > 0 {
-		schemaMap := make(map[string]*config.Output)
-		if schema != nil {
-			for _, s := range schema {
-				schemaMap[s.Name] = s
-			}
-		}
-
-		if includeHeader {
-			outputBuf.WriteString("[reset][bold][green]\nOutputs:\n\n")
-		}
-
-		// Output the outputs in alphabetical order
-		keyLen := 0
-		ks := make([]string, 0, len(outputs))
-		for key, _ := range outputs {
-			ks = append(ks, key)
-			if len(key) > keyLen {
-				keyLen = len(key)
-			}
-		}
-		sort.Strings(ks)
-
-		for _, k := range ks {
-			schema, ok := schemaMap[k]
-			if ok && schema.Sensitive {
-				outputBuf.WriteString(fmt.Sprintf("%s = <sensitive>\n", k))
-				continue
-			}
-
-			v := outputs[k]
-			switch typedV := v.Value.(type) {
-			case string:
-				outputBuf.WriteString(fmt.Sprintf("%s = %s\n", k, typedV))
-			case []interface{}:
-				outputBuf.WriteString(formatListOutput("", k, typedV))
-				outputBuf.WriteString("\n")
-			case map[string]interface{}:
-				outputBuf.WriteString(formatMapOutput("", k, typedV))
-				outputBuf.WriteString("\n")
-			}
-		}
-	}
-
-	return strings.TrimSpace(outputBuf.String())
-}
-
-const outputInterrupt = `Interrupt received.
-Please wait for Terraform to exit or data loss may occur.
-Gracefully shutting down...`

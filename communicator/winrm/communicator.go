@@ -10,9 +10,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform/communicator/remote"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/provisioners"
 	"github.com/masterzen/winrm"
 	"github.com/packer-community/winrmcp/winrmcp"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // Communicator represents the WinRM communicator
@@ -24,8 +25,8 @@ type Communicator struct {
 }
 
 // New creates a new communicator implementation over WinRM.
-func New(s *terraform.InstanceState) (*Communicator, error) {
-	connInfo, err := parseConnectionInfo(s)
+func New(v cty.Value) (*Communicator, error) {
+	connInfo, err := parseConnectionInfo(v)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +36,7 @@ func New(s *terraform.InstanceState) (*Communicator, error) {
 		Port:     connInfo.Port,
 		HTTPS:    connInfo.HTTPS,
 		Insecure: connInfo.Insecure,
+		Timeout:  connInfo.TimeoutVal,
 	}
 	if len(connInfo.CACert) > 0 {
 		endpoint.CACert = []byte(connInfo.CACert)
@@ -51,14 +53,13 @@ func New(s *terraform.InstanceState) (*Communicator, error) {
 }
 
 // Connect implementation of communicator.Communicator interface
-func (c *Communicator) Connect(o terraform.UIOutput) error {
-	if c.client != nil {
-		return nil
-	}
+func (c *Communicator) Connect(o provisioners.UIOutput) error {
+	// Set the client to nil since we'll (re)create it
+	c.client = nil
 
 	params := winrm.DefaultParameters
 	params.Timeout = formatDuration(c.Timeout())
-	if c.connInfo.NTLM == true {
+	if c.connInfo.NTLM {
 		params.TransportDecorator = func() winrm.Transporter { return &winrm.ClientNTLM{} }
 	}
 
@@ -189,7 +190,7 @@ func (c *Communicator) newCopyClient() (*winrmcp.Winrmcp, error) {
 		MaxOperationsPerShell: 15, // lowest common denominator
 	}
 
-	if c.connInfo.NTLM == true {
+	if c.connInfo.NTLM {
 		config.TransportDecorator = func() winrm.Transporter { return &winrm.ClientNTLM{} }
 	}
 

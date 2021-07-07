@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	version "github.com/hashicorp/go-version"
-	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/configs"
 )
 
@@ -17,7 +17,7 @@ import (
 // in spite of the errors.
 //
 // LoadConfig performs the basic syntax and uniqueness validations that are
-// required to process the individual modules, and also detects
+// required to process the individual modules
 func (l *Loader) LoadConfig(rootDir string) (*configs.Config, hcl.Diagnostics) {
 	rootMod, diags := l.parser.LoadConfigDir(rootDir)
 	if rootMod == nil {
@@ -31,15 +31,14 @@ func (l *Loader) LoadConfig(rootDir string) (*configs.Config, hcl.Diagnostics) {
 }
 
 // moduleWalkerLoad is a configs.ModuleWalkerFunc for loading modules that
-// are presumed to have already been installed. A different function
-// (moduleWalkerInstall) is used for installation.
+// are presumed to have already been installed.
 func (l *Loader) moduleWalkerLoad(req *configs.ModuleRequest) (*configs.Module, *version.Version, hcl.Diagnostics) {
 	// Since we're just loading here, we expect that all referenced modules
 	// will be already installed and described in our manifest. However, we
 	// do verify that the manifest and the configuration are in agreement
 	// so that we can prompt the user to run "terraform init" if not.
 
-	key := manifestKey(req.Path)
+	key := l.modules.manifest.ModuleKey(req.Path)
 	record, exists := l.modules.manifest[key]
 
 	if !exists {
@@ -64,7 +63,15 @@ func (l *Loader) moduleWalkerLoad(req *configs.ModuleRequest) (*configs.Module, 
 			Subject:  &req.SourceAddrRange,
 		})
 	}
-	if !req.VersionConstraint.Required.Check(record.Version) {
+	if len(req.VersionConstraint.Required) > 0 && record.Version == nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Module version requirements have changed",
+			Detail:   "The version requirements have changed since this module was installed and the installed version is no longer acceptable. Run \"terraform init\" to install all modules required by this configuration.",
+			Subject:  &req.SourceAddrRange,
+		})
+	}
+	if record.Version != nil && !req.VersionConstraint.Required.Check(record.Version) {
 		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
 			Summary:  "Module version requirements have changed",

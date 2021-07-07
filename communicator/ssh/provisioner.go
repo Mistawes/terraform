@@ -3,19 +3,20 @@ package ssh
 import (
 	"bytes"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform/communicator/shared"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/mitchellh/mapstructure"
-	"github.com/xanzy/ssh-agent"
+	sshagent "github.com/xanzy/ssh-agent"
+	"github.com/zclconf/go-cty/cty"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -28,52 +29,126 @@ const (
 	// DefaultPort is used if there is no port given
 	DefaultPort = 22
 
-	// DefaultScriptPath is used as the path to copy the file to
-	// for remote execution if not provided otherwise.
-	DefaultScriptPath = "/tmp/terraform_%RAND%.sh"
+	// DefaultUnixScriptPath is used as the path to copy the file to
+	// for remote execution on unix if not provided otherwise.
+	DefaultUnixScriptPath = "/tmp/terraform_%RAND%.sh"
+	// DefaultWindowsScriptPath is used as the path to copy the file to
+	// for remote execution on windows if not provided otherwise.
+	DefaultWindowsScriptPath = "C:/windows/temp/terraform_%RAND%.cmd"
 
 	// DefaultTimeout is used if there is no timeout given
 	DefaultTimeout = 5 * time.Minute
+
+	// TargetPlatformUnix used for cleaner code, and is used if no target platform has been specified
+	TargetPlatformUnix = "unix"
+	//TargetPlatformWindows used for cleaner code
+	TargetPlatformWindows = "windows"
 )
 
 // connectionInfo is decoded from the ConnInfo of the resource. These are the
 // only keys we look at. If a PrivateKey is given, that is used instead
 // of a password.
 type connectionInfo struct {
-	User       string
-	Password   string
-	PrivateKey string `mapstructure:"private_key"`
-	Host       string
-	HostKey    string `mapstructure:"host_key"`
-	Port       int
-	Agent      bool
-	Timeout    string
-	ScriptPath string        `mapstructure:"script_path"`
-	TimeoutVal time.Duration `mapstructure:"-"`
+	User           string
+	Password       string
+	PrivateKey     string
+	Certificate    string
+	Host           string
+	HostKey        string
+	Port           int
+	Agent          bool
+	ScriptPath     string
+	TargetPlatform string
+	Timeout        string
+	TimeoutVal     time.Duration
 
-	BastionUser       string `mapstructure:"bastion_user"`
-	BastionPassword   string `mapstructure:"bastion_password"`
-	BastionPrivateKey string `mapstructure:"bastion_private_key"`
-	BastionHost       string `mapstructure:"bastion_host"`
-	BastionHostKey    string `mapstructure:"bastion_host_key"`
-	BastionPort       int    `mapstructure:"bastion_port"`
+	BastionUser        string
+	BastionPassword    string
+	BastionPrivateKey  string
+	BastionCertificate string
+	BastionHost        string
+	BastionHostKey     string
+	BastionPort        int
 
-	AgentIdentity string `mapstructure:"agent_identity"`
+	AgentIdentity string
 }
 
-// parseConnectionInfo is used to convert the ConnInfo of the InstanceState into
-// a ConnectionInfo struct
-func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
+// decodeConnInfo decodes the given cty.Value using the same behavior as the
+// lgeacy mapstructure decoder in order to preserve as much of the existing
+// logic as possible for compatibility.
+func decodeConnInfo(v cty.Value) (*connectionInfo, error) {
 	connInfo := &connectionInfo{}
-	decConf := &mapstructure.DecoderConfig{
-		WeaklyTypedInput: true,
-		Result:           connInfo,
+	if v.IsNull() {
+		return connInfo, nil
 	}
-	dec, err := mapstructure.NewDecoder(decConf)
+
+	for k, v := range v.AsValueMap() {
+		if v.IsNull() {
+			continue
+		}
+
+		switch k {
+		case "user":
+			connInfo.User = v.AsString()
+		case "password":
+			connInfo.Password = v.AsString()
+		case "private_key":
+			connInfo.PrivateKey = v.AsString()
+		case "certificate":
+			connInfo.Certificate = v.AsString()
+		case "host":
+			connInfo.Host = v.AsString()
+		case "host_key":
+			connInfo.HostKey = v.AsString()
+		case "port":
+			p, err := strconv.Atoi(v.AsString())
+			if err != nil {
+				return nil, err
+			}
+			connInfo.Port = p
+		case "agent":
+			connInfo.Agent = v.True()
+		case "script_path":
+			connInfo.ScriptPath = v.AsString()
+		case "target_platform":
+			connInfo.TargetPlatform = v.AsString()
+		case "timeout":
+			connInfo.Timeout = v.AsString()
+		case "bastion_user":
+			connInfo.BastionUser = v.AsString()
+		case "bastion_password":
+			connInfo.BastionPassword = v.AsString()
+		case "bastion_private_key":
+			connInfo.BastionPrivateKey = v.AsString()
+		case "bastion_certificate":
+			connInfo.BastionCertificate = v.AsString()
+		case "bastion_host":
+			connInfo.BastionHost = v.AsString()
+		case "bastion_host_key":
+			connInfo.BastionHostKey = v.AsString()
+		case "bastion_port":
+			p, err := strconv.Atoi(v.AsString())
+			if err != nil {
+				return nil, err
+			}
+			connInfo.BastionPort = p
+		case "agent_identity":
+			connInfo.AgentIdentity = v.AsString()
+		}
+	}
+	return connInfo, nil
+}
+
+// parseConnectionInfo is used to convert the raw configuration into the
+// *connectionInfo struct.
+func parseConnectionInfo(v cty.Value) (*connectionInfo, error) {
+	v, err := shared.ConnectionBlockSupersetSchema.CoerceValue(v)
 	if err != nil {
 		return nil, err
 	}
-	if err := dec.Decode(s.Ephemeral.ConnInfo); err != nil {
+
+	connInfo, err := decodeConnInfo(v)
+	if err != nil {
 		return nil, err
 	}
 
@@ -82,12 +157,19 @@ func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
 	//
 	// And if SSH_AUTH_SOCK is not set, there's no agent to connect to, so we
 	// shouldn't try.
-	if s.Ephemeral.ConnInfo["agent"] == "" && os.Getenv("SSH_AUTH_SOCK") != "" {
+	agent := v.GetAttr("agent")
+	if agent.IsNull() && os.Getenv("SSH_AUTH_SOCK") != "" {
 		connInfo.Agent = true
 	}
 
 	if connInfo.User == "" {
 		connInfo.User = DefaultUser
+	}
+
+	// Check if host is empty.
+	// Otherwise return error.
+	if connInfo.Host == "" {
+		return nil, fmt.Errorf("host for provisioner cannot be empty")
 	}
 
 	// Format the host if needed.
@@ -97,8 +179,19 @@ func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
 	if connInfo.Port == 0 {
 		connInfo.Port = DefaultPort
 	}
-	if connInfo.ScriptPath == "" {
-		connInfo.ScriptPath = DefaultScriptPath
+	// Set default targetPlatform to unix if it's empty
+	if connInfo.TargetPlatform == "" {
+		connInfo.TargetPlatform = TargetPlatformUnix
+	} else if connInfo.TargetPlatform != TargetPlatformUnix && connInfo.TargetPlatform != TargetPlatformWindows {
+		return nil, fmt.Errorf("target_platform for provisioner has to be either %s or %s", TargetPlatformUnix, TargetPlatformWindows)
+	}
+	// Choose an appropriate default script path based on the target platform. There is no single
+	// suitable default script path which works on both UNIX and Windows targets.
+	if connInfo.ScriptPath == "" && connInfo.TargetPlatform == TargetPlatformUnix {
+		connInfo.ScriptPath = DefaultUnixScriptPath
+	}
+	if connInfo.ScriptPath == "" && connInfo.TargetPlatform == TargetPlatformWindows {
+		connInfo.ScriptPath = DefaultWindowsScriptPath
 	}
 	if connInfo.Timeout != "" {
 		connInfo.TimeoutVal = safeDuration(connInfo.Timeout, DefaultTimeout)
@@ -120,6 +213,9 @@ func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
 		}
 		if connInfo.BastionPrivateKey == "" {
 			connInfo.BastionPrivateKey = connInfo.PrivateKey
+		}
+		if connInfo.BastionCertificate == "" {
+			connInfo.BastionCertificate = connInfo.Certificate
 		}
 		if connInfo.BastionPort == 0 {
 			connInfo.BastionPort = connInfo.Port
@@ -150,12 +246,13 @@ func prepareSSHConfig(connInfo *connectionInfo) (*sshConfig, error) {
 	host := fmt.Sprintf("%s:%d", connInfo.Host, connInfo.Port)
 
 	sshConf, err := buildSSHClientConfig(sshClientConfigOpts{
-		user:       connInfo.User,
-		host:       host,
-		privateKey: connInfo.PrivateKey,
-		password:   connInfo.Password,
-		hostKey:    connInfo.HostKey,
-		sshAgent:   sshAgent,
+		user:        connInfo.User,
+		host:        host,
+		privateKey:  connInfo.PrivateKey,
+		password:    connInfo.Password,
+		hostKey:     connInfo.HostKey,
+		certificate: connInfo.Certificate,
+		sshAgent:    sshAgent,
 	})
 	if err != nil {
 		return nil, err
@@ -168,12 +265,13 @@ func prepareSSHConfig(connInfo *connectionInfo) (*sshConfig, error) {
 		bastionHost := fmt.Sprintf("%s:%d", connInfo.BastionHost, connInfo.BastionPort)
 
 		bastionConf, err = buildSSHClientConfig(sshClientConfigOpts{
-			user:       connInfo.BastionUser,
-			host:       bastionHost,
-			privateKey: connInfo.BastionPrivateKey,
-			password:   connInfo.BastionPassword,
-			hostKey:    connInfo.HostKey,
-			sshAgent:   sshAgent,
+			user:        connInfo.BastionUser,
+			host:        bastionHost,
+			privateKey:  connInfo.BastionPrivateKey,
+			password:    connInfo.BastionPassword,
+			hostKey:     connInfo.HostKey,
+			certificate: connInfo.BastionCertificate,
+			sshAgent:    sshAgent,
 		})
 		if err != nil {
 			return nil, err
@@ -191,12 +289,13 @@ func prepareSSHConfig(connInfo *connectionInfo) (*sshConfig, error) {
 }
 
 type sshClientConfigOpts struct {
-	privateKey string
-	password   string
-	sshAgent   *sshAgent
-	user       string
-	host       string
-	hostKey    string
+	privateKey  string
+	password    string
+	sshAgent    *sshAgent
+	certificate string
+	user        string
+	host        string
+	hostKey     string
 }
 
 func buildSSHClientConfig(opts sshClientConfigOpts) (*ssh.ClientConfig, error) {
@@ -234,11 +333,23 @@ func buildSSHClientConfig(opts sshClientConfigOpts) (*ssh.ClientConfig, error) {
 	}
 
 	if opts.privateKey != "" {
-		pubKeyAuth, err := readPrivateKey(opts.privateKey)
-		if err != nil {
-			return nil, err
+		if opts.certificate != "" {
+			log.Println("using client certificate for authentication")
+
+			certSigner, err := signCertWithPrivateKey(opts.privateKey, opts.certificate)
+			if err != nil {
+				return nil, err
+			}
+			conf.Auth = append(conf.Auth, certSigner)
+		} else {
+			log.Println("using private key for authentication")
+
+			pubKeyAuth, err := readPrivateKey(opts.privateKey)
+			if err != nil {
+				return nil, err
+			}
+			conf.Auth = append(conf.Auth, pubKeyAuth)
 		}
-		conf.Auth = append(conf.Auth, pubKeyAuth)
 	}
 
 	if opts.password != "" {
@@ -254,29 +365,54 @@ func buildSSHClientConfig(opts sshClientConfigOpts) (*ssh.ClientConfig, error) {
 	return conf, nil
 }
 
+// Create a Cert Signer and return ssh.AuthMethod
+func signCertWithPrivateKey(pk string, certificate string) (ssh.AuthMethod, error) {
+	rawPk, err := ssh.ParseRawPrivateKey([]byte(pk))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key %q: %s", pk, err)
+	}
+
+	pcert, _, _, _, err := ssh.ParseAuthorizedKey([]byte(certificate))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate %q: %s", certificate, err)
+	}
+
+	usigner, err := ssh.NewSignerFromKey(rawPk)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer from raw private key %q: %s", rawPk, err)
+	}
+
+	ucertSigner, err := ssh.NewCertSigner(pcert.(*ssh.Certificate), usigner)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cert signer %q: %s", usigner, err)
+	}
+
+	return ssh.PublicKeys(ucertSigner), nil
+}
+
 func readPrivateKey(pk string) (ssh.AuthMethod, error) {
 	// We parse the private key on our own first so that we can
 	// show a nicer error if the private key has a password.
 	block, _ := pem.Decode([]byte(pk))
 	if block == nil {
-		return nil, fmt.Errorf("Failed to read key %q: no key found", pk)
+		return nil, errors.New("Failed to read ssh private key: no key found")
 	}
 	if block.Headers["Proc-Type"] == "4,ENCRYPTED" {
-		return nil, fmt.Errorf(
-			"Failed to read key %q: password protected keys are\n"+
-				"not supported. Please decrypt the key prior to use.", pk)
+		return nil, errors.New(
+			"Failed to read ssh private key: password protected keys are\n" +
+				"not supported. Please decrypt the key prior to use.")
 	}
 
 	signer, err := ssh.ParsePrivateKey([]byte(pk))
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse key file %q: %s", pk, err)
+		return nil, fmt.Errorf("Failed to parse ssh private key: %s", err)
 	}
 
 	return ssh.PublicKeys(signer), nil
 }
 
 func connectToAgent(connInfo *connectionInfo) (*sshAgent, error) {
-	if connInfo.Agent != true {
+	if !connInfo.Agent {
 		// No agent configured
 		return nil, nil
 	}
@@ -410,13 +546,6 @@ func (s *sshAgent) sortSigners(signers []ssh.Signer) {
 			head++
 			continue
 		}
-	}
-
-	ss := []string{}
-	for _, signer := range signers {
-		pk := signer.PublicKey()
-		k := pk.(*agent.Key)
-		ss = append(ss, k.Comment)
 	}
 }
 

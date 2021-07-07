@@ -1,57 +1,54 @@
 ---
-layout: "docs"
-page_title: "Configuring Modules"
-sidebar_current: "docs-config-modules"
-description: |-
-  Modules are used in Terraform to modularize and encapsulate groups of resources in your infrastructure. For more information on modules, see the dedicated modules section.
+layout: "language"
+page_title: "Modules Landing Page - Configuration Language"
 ---
 
-# Module Configuration
+# Modules Landing Page
 
-Modules are used in Terraform to modularize and encapsulate groups of
-resources in your infrastructure. For more information on modules, see
-the dedicated
-[modules section](/docs/modules/index.html).
+To improve navigation, we've split the old Modules page into several smaller
+pages.
 
-This page assumes you're familiar with the
-[configuration syntax](/docs/configuration/syntax.html)
-already.
+<a id="calling-a-child-module"></a>
+<a id="accessing-module-output-values"></a>
+<a id="transferring-resource-state-into-modules"></a>
+<a id="tainting-resources-within-a-module"></a>
+<a id="module-versions"></a>
+<a id="other-meta-arguments"></a>
 
-## Example
+## Syntax and Elements of Module Blocks
 
-```hcl
-module "consul" {
-  source  = "hashicorp/consul/aws"
-  servers = 5
-}
-```
+This information has moved to
+[Module Blocks](/docs/language/modules/syntax.html).
 
-## Description
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
 
-A `module` block instructs Terraform to create an instance of a module,
-and in turn to instantiate any resources defined within it.
 
-The name given in the block header is used to reference the particular module
-instance from expressions within the calling module, and to refer to the
-module on the command line. It has no meaning outside of a particular
-Terraform configuration.
 
-Within the block body is the configuration for the module. All attributes
-within the block must correspond to [variables](/docs/configuration/variables.html)
-within the module, with the exception of the following which Terraform
-treats as special:
+<a id="multiple-instances-of-a-module"></a>
 
-* `source` - (Required) A [module source](/docs/modules/sources.html) string
-  specifying the location of the child module source code.
+## Multiple Instances with `count` and `for_each`
 
-* `version` - (Optional) A [version constraint](/docs/modules/usage.html#module-versions)
-  string that specifies which versions of the referenced module are acceptable.
-  The newest version matching the constraint will be used. `version` is supported
-  only for modules retrieved from module registries.
+This information has moved to
+[`count`](/docs/language/meta-arguments/count.html) and
+[`for_each`](/docs/language/meta-arguments/for_each.html).
 
-* `providers` - (Optional) A map whose keys are provider configuration names
-  that are expected by child module and whose values are corresponding
-  provider names in the calling module. This allows
-  [provider configurations to be passed explicitly to child modules](/docs/modules/usage.html#providers-within-modules).
-  If not specified, the child module inherits all of the default (un-aliased)
-  provider configurations from the calling module.
+<div style="height: 100vh; margin: 0; padding: 0;"></div>
+
+
+
+<a id="providers-within-modules"></a>
+<a id="provider-version-constraints-in-modules"></a>
+<a id="implicit-provider-inheritance"></a>
+<a id="passing-providers-explicitly"></a>
+<a id="proxy-configuration-blocks"></a>
+<a id="legacy-shared-modules-with-provider-configurations"></a>
+
+## Handling Provider Configurations in Re-usable Modules
+
+This information has moved to
+[The `providers` Meta-Argument](/docs/language/meta-arguments/module-providers.html)
+(for users of re-usable modules) and
+[Providers Within Modules](/docs/language/modules/develop/providers.html)
+(for module developers).
+
+<div style="height: 100vh; margin: 0; padding: 0;"></div>

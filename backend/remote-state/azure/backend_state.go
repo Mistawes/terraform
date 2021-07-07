@@ -1,15 +1,17 @@
 package azure
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/state"
-	"github.com/hashicorp/terraform/state/remote"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/states/remote"
+	"github.com/hashicorp/terraform/states/statemgr"
+	"github.com/tombuildsstuff/giovanni/storage/2018-11-09/blob/blobs"
+	"github.com/tombuildsstuff/giovanni/storage/2018-11-09/blob/containers"
 )
 
 const (
@@ -18,20 +20,24 @@ const (
 	keyEnvPrefix = "env:"
 )
 
-func (b *Backend) States() ([]string, error) {
+func (b *Backend) Workspaces() ([]string, error) {
 	prefix := b.keyName + keyEnvPrefix
-	params := storage.ListBlobsParameters{
-		Prefix: prefix,
+	params := containers.ListBlobsInput{
+		Prefix: &prefix,
 	}
 
-	container := b.blobClient.GetContainerReference(b.containerName)
-	resp, err := container.ListBlobs(params)
+	ctx := context.TODO()
+	client, err := b.armClient.getContainersClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.ListBlobs(ctx, b.armClient.storageAccountName, b.containerName, params)
 	if err != nil {
 		return nil, err
 	}
 
 	envs := map[string]struct{}{}
-	for _, obj := range resp.Blobs {
+	for _, obj := range resp.Blobs.Blobs {
 		key := obj.Name
 		if strings.HasPrefix(key, prefix) {
 			name := strings.TrimPrefix(key, prefix)
@@ -52,32 +58,52 @@ func (b *Backend) States() ([]string, error) {
 	return result, nil
 }
 
-func (b *Backend) DeleteState(name string) error {
+func (b *Backend) DeleteWorkspace(name string) error {
 	if name == backend.DefaultStateName || name == "" {
 		return fmt.Errorf("can't delete default state")
 	}
 
-	containerReference := b.blobClient.GetContainerReference(b.containerName)
-	blobReference := containerReference.GetBlobReference(b.path(name))
-	options := &storage.DeleteBlobOptions{}
+	ctx := context.TODO()
+	client, err := b.armClient.getBlobClient(ctx)
+	if err != nil {
+		return err
+	}
 
-	return blobReference.Delete(options)
+	if resp, err := client.Delete(ctx, b.armClient.storageAccountName, b.containerName, b.path(name), blobs.DeleteInput{}); err != nil {
+		if resp.Response.StatusCode != 404 {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (b *Backend) State(name string) (state.State, error) {
+func (b *Backend) StateMgr(name string) (statemgr.Full, error) {
+	ctx := context.TODO()
+	blobClient, err := b.armClient.getBlobClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	client := &RemoteClient{
-		blobClient:    b.blobClient,
-		containerName: b.containerName,
-		keyName:       b.path(name),
+		giovanniBlobClient: *blobClient,
+		containerName:      b.containerName,
+		keyName:            b.path(name),
+		accountName:        b.accountName,
+		snapshot:           b.snapshot,
 	}
 
 	stateMgr := &remote.State{Client: client}
 
+	// Grab the value
+	if err := stateMgr.RefreshState(); err != nil {
+		return nil, err
+	}
 	//if this isn't the default state name, we need to create the object so
 	//it's listed by States.
-	if name != backend.DefaultStateName {
+	if v := stateMgr.State(); v == nil {
 		// take a lock on this state while we write it
-		lockInfo := state.NewLockInfo()
+		lockInfo := statemgr.NewLockInfo()
 		lockInfo.Operation = "init"
 		lockId, err := client.Lock(lockInfo)
 		if err != nil {
@@ -97,10 +123,11 @@ func (b *Backend) State(name string) (state.State, error) {
 			err = lockUnlock(err)
 			return nil, err
 		}
-
-		// If we have no state, we have to create an empty state
+		//if this isn't the default state name, we need to create the object so
+		//it's listed by States.
 		if v := stateMgr.State(); v == nil {
-			if err := stateMgr.WriteState(terraform.NewState()); err != nil {
+			// If we have no state, we have to create an empty state
+			if err := stateMgr.WriteState(states.NewState()); err != nil {
 				err = lockUnlock(err)
 				return nil, err
 			}
@@ -108,13 +135,12 @@ func (b *Backend) State(name string) (state.State, error) {
 				err = lockUnlock(err)
 				return nil, err
 			}
-		}
 
-		// Unlock, the state should now be initialized
-		if err := lockUnlock(nil); err != nil {
-			return nil, err
+			// Unlock, the state should now be initialized
+			if err := lockUnlock(nil); err != nil {
+				return nil, err
+			}
 		}
-
 	}
 
 	return stateMgr, nil

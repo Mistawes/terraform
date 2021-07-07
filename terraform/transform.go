@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"github.com/hashicorp/terraform/dag"
+	"github.com/hashicorp/terraform/internal/logging"
 )
 
 // GraphTransformer is the interface that transformers implement. This
@@ -22,29 +23,23 @@ type GraphVertexTransformer interface {
 	Transform(dag.Vertex) (dag.Vertex, error)
 }
 
-// GraphTransformIf is a helper function that conditionally returns a
-// GraphTransformer given. This is useful for calling inline a sequence
-// of transforms without having to split it up into multiple append() calls.
-func GraphTransformIf(f func() bool, then GraphTransformer) GraphTransformer {
-	if f() {
-		return then
-	}
-
-	return nil
-}
-
 type graphTransformerMulti struct {
 	Transforms []GraphTransformer
 }
 
 func (t *graphTransformerMulti) Transform(g *Graph) error {
+	var lastStepStr string
 	for _, t := range t.Transforms {
+		log.Printf("[TRACE] (graphTransformerMulti) Executing graph transform %T", t)
 		if err := t.Transform(g); err != nil {
 			return err
 		}
-		log.Printf(
-			"[TRACE] Graph after step %T:\n\n%s",
-			t, g.StringWithNodeTypes())
+		if thisStepStr := g.StringWithNodeTypes(); thisStepStr != lastStepStr {
+			log.Printf("[TRACE] (graphTransformerMulti) Completed graph transform %T with new graph:\n%s  ------", t, logging.Indent(thisStepStr))
+			lastStepStr = thisStepStr
+		} else {
+			log.Printf("[TRACE] (graphTransformerMulti) Completed graph transform %T (no changes)", t)
+		}
 	}
 
 	return nil

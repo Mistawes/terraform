@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/hashicorp/terraform/helper/wrappedreadline"
+	"github.com/hashicorp/terraform/internal/helper/wrappedreadline"
 	"github.com/hashicorp/terraform/repl"
 
 	"github.com/chzyer/readline"
@@ -45,13 +45,12 @@ func (c *ConsoleCommand) modeInteractive(session *repl.Session, ui cli.Ui) int {
 			break
 		}
 
-		out, err := session.Handle(line)
-		if err == repl.ErrSessionExit {
-			break
+		out, exit, diags := session.Handle(line)
+		if diags.HasErrors() {
+			c.showDiagnostics(diags)
 		}
-		if err != nil {
-			ui.Error(err.Error())
-			continue
+		if exit {
+			break
 		}
 
 		ui.Output(out)

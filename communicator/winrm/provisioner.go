@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform/communicator/shared"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/mitchellh/mapstructure"
+	"github.com/zclconf/go-cty/cty"
 )
 
 const (
@@ -18,6 +18,9 @@ const (
 
 	// DefaultPort is used if there is no port given
 	DefaultPort = 5985
+
+	// DefaultHTTPSPort is used if there is no port given and HTTPS is true
+	DefaultHTTPSPort = 5986
 
 	// DefaultScriptPath is used as the path to copy the file to
 	// for remote execution if not provided otherwise.
@@ -44,22 +47,62 @@ type connectionInfo struct {
 	TimeoutVal time.Duration `mapstructure:"-"`
 }
 
+// decodeConnInfo decodes the given cty.Value using the same behavior as the
+// lgeacy mapstructure decoder in order to preserve as much of the existing
+// logic as possible for compatibility.
+func decodeConnInfo(v cty.Value) (*connectionInfo, error) {
+	connInfo := &connectionInfo{}
+	if v.IsNull() {
+		return connInfo, nil
+	}
+
+	for k, v := range v.AsValueMap() {
+		if v.IsNull() {
+			continue
+		}
+
+		switch k {
+		case "user":
+			connInfo.User = v.AsString()
+		case "password":
+			connInfo.Password = v.AsString()
+		case "host":
+			connInfo.Host = v.AsString()
+		case "port":
+			p, err := strconv.Atoi(v.AsString())
+			if err != nil {
+				return nil, err
+			}
+			connInfo.Port = p
+		case "https":
+			connInfo.HTTPS = v.True()
+		case "insecure":
+			connInfo.Insecure = v.True()
+		case "use_ntlm":
+			connInfo.NTLM = v.True()
+		case "cacert":
+			connInfo.CACert = v.AsString()
+		case "script_path":
+			connInfo.ScriptPath = v.AsString()
+		case "timeout":
+			connInfo.Timeout = v.AsString()
+		}
+	}
+	return connInfo, nil
+}
+
 // parseConnectionInfo is used to convert the ConnInfo of the InstanceState into
 // a ConnectionInfo struct
-func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
-	connInfo := &connectionInfo{}
-	decConf := &mapstructure.DecoderConfig{
-		WeaklyTypedInput: true,
-		Result:           connInfo,
-	}
-	dec, err := mapstructure.NewDecoder(decConf)
+func parseConnectionInfo(v cty.Value) (*connectionInfo, error) {
+	v, err := shared.ConnectionBlockSupersetSchema.CoerceValue(v)
 	if err != nil {
 		return nil, err
 	}
-	if err := dec.Decode(s.Ephemeral.ConnInfo); err != nil {
+
+	connInfo, err := decodeConnInfo(v)
+	if err != nil {
 		return nil, err
 	}
-
 	// Check on script paths which point to the default Windows TEMP folder because files
 	// which are put in there very early in the boot process could get cleaned/deleted
 	// before you had the change to execute them.
@@ -80,7 +123,11 @@ func parseConnectionInfo(s *terraform.InstanceState) (*connectionInfo, error) {
 	connInfo.Host = shared.IpFormat(connInfo.Host)
 
 	if connInfo.Port == 0 {
-		connInfo.Port = DefaultPort
+		if connInfo.HTTPS {
+			connInfo.Port = DefaultHTTPSPort
+		} else {
+			connInfo.Port = DefaultPort
+		}
 	}
 	if connInfo.ScriptPath == "" {
 		connInfo.ScriptPath = DefaultScriptPath

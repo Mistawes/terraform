@@ -2,189 +2,162 @@ package terraform
 
 import (
 	"fmt"
+	"log"
 
-	"github.com/hashicorp/terraform/config"
+	"github.com/hashicorp/terraform/plans"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/tfdiags"
+
+	"github.com/hashicorp/terraform/addrs"
 )
 
 // NodePlannableResourceInstance represents a _single_ resource
 // instance that is plannable. This means this represents a single
 // count index, for example.
 type NodePlannableResourceInstance struct {
-	*NodeAbstractResource
+	*NodeAbstractResourceInstance
+	ForceCreateBeforeDestroy bool
+	skipRefresh              bool
 }
 
+var (
+	_ GraphNodeModuleInstance       = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeReferenceable        = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeReferencer           = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeConfigResource       = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeResourceInstance     = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeAttachResourceConfig = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeAttachResourceState  = (*NodePlannableResourceInstance)(nil)
+	_ GraphNodeExecutable           = (*NodePlannableResourceInstance)(nil)
+)
+
 // GraphNodeEvalable
-func (n *NodePlannableResourceInstance) EvalTree() EvalNode {
-	addr := n.NodeAbstractResource.Addr
-
-	// stateId is the ID to put into the state
-	stateId := addr.stateId()
-
-	// Build the instance info. More of this will be populated during eval
-	info := &InstanceInfo{
-		Id:         stateId,
-		Type:       addr.Type,
-		ModulePath: normalizeModulePath(addr.Path),
-	}
-
-	// Build the resource for eval
-	resource := &Resource{
-		Name:       addr.Name,
-		Type:       addr.Type,
-		CountIndex: addr.Index,
-	}
-	if resource.CountIndex < 0 {
-		resource.CountIndex = 0
-	}
-
-	// Determine the dependencies for the state.
-	stateDeps := n.StateReferences()
+func (n *NodePlannableResourceInstance) Execute(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
+	addr := n.ResourceInstanceAddr()
 
 	// Eval info is different depending on what kind of resource this is
-	switch n.Config.Mode {
-	case config.ManagedResourceMode:
-		return n.evalTreeManagedResource(
-			stateId, info, resource, stateDeps,
-		)
-	case config.DataResourceMode:
-		return n.evalTreeDataResource(
-			stateId, info, resource, stateDeps)
+	switch addr.Resource.Resource.Mode {
+	case addrs.ManagedResourceMode:
+		return n.managedResourceExecute(ctx)
+	case addrs.DataResourceMode:
+		return n.dataResourceExecute(ctx)
 	default:
 		panic(fmt.Errorf("unsupported resource mode %s", n.Config.Mode))
 	}
 }
 
-func (n *NodePlannableResourceInstance) evalTreeDataResource(
-	stateId string, info *InstanceInfo,
-	resource *Resource, stateDeps []string) EvalNode {
-	var provider ResourceProvider
-	var config *ResourceConfig
-	var diff *InstanceDiff
-	var state *InstanceState
+func (n *NodePlannableResourceInstance) dataResourceExecute(ctx EvalContext) (diags tfdiags.Diagnostics) {
+	config := n.Config
+	addr := n.ResourceInstanceAddr()
 
-	return &EvalSequence{
-		Nodes: []EvalNode{
-			&EvalReadState{
-				Name:   stateId,
-				Output: &state,
-			},
+	var change *plans.ResourceInstanceChange
+	var state *states.ResourceInstanceObject
 
-			// We need to re-interpolate the config here because some
-			// of the attributes may have become computed during
-			// earlier planning, due to other resources having
-			// "requires new resource" diffs.
-			&EvalInterpolate{
-				Config:   n.Config.RawConfig.Copy(),
-				Resource: resource,
-				Output:   &config,
-			},
-
-			&EvalIf{
-				If: func(ctx EvalContext) (bool, error) {
-					computed := config.ComputedKeys != nil && len(config.ComputedKeys) > 0
-
-					// If the configuration is complete and we
-					// already have a state then we don't need to
-					// do any further work during apply, because we
-					// already populated the state during refresh.
-					if !computed && state != nil {
-						return true, EvalEarlyExitError{}
-					}
-
-					return true, nil
-				},
-				Then: EvalNoop{},
-			},
-
-			&EvalGetProvider{
-				Name:   n.ResolvedProvider,
-				Output: &provider,
-			},
-
-			&EvalReadDataDiff{
-				Info:        info,
-				Config:      &config,
-				Provider:    &provider,
-				Output:      &diff,
-				OutputState: &state,
-			},
-
-			&EvalWriteState{
-				Name:         stateId,
-				ResourceType: n.Config.Type,
-				Provider:     n.ResolvedProvider,
-				Dependencies: stateDeps,
-				State:        &state,
-			},
-
-			&EvalWriteDiff{
-				Name: stateId,
-				Diff: &diff,
-			},
-		},
+	_, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
+	diags = diags.Append(err)
+	if diags.HasErrors() {
+		return diags
 	}
+
+	state, err = n.readResourceInstanceState(ctx, addr)
+	diags = diags.Append(err)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	diags = diags.Append(validateSelfRef(addr.Resource, config.Config, providerSchema))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	change, state, planDiags := n.planDataSource(ctx, state)
+	diags = diags.Append(planDiags)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	// write the data source into both the refresh state and the
+	// working state
+	diags = diags.Append(n.writeResourceInstanceState(ctx, state, nil, refreshState))
+	if diags.HasErrors() {
+		return diags
+	}
+	diags = diags.Append(n.writeResourceInstanceState(ctx, state, nil, workingState))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	diags = diags.Append(n.writeChange(ctx, change, ""))
+	return diags
 }
 
-func (n *NodePlannableResourceInstance) evalTreeManagedResource(
-	stateId string, info *InstanceInfo,
-	resource *Resource, stateDeps []string) EvalNode {
-	// Declare a bunch of variables that are used for state during
-	// evaluation. Most of this are written to by-address below.
-	var provider ResourceProvider
-	var diff *InstanceDiff
-	var state *InstanceState
-	var resourceConfig *ResourceConfig
+func (n *NodePlannableResourceInstance) managedResourceExecute(ctx EvalContext) (diags tfdiags.Diagnostics) {
+	config := n.Config
+	addr := n.ResourceInstanceAddr()
 
-	return &EvalSequence{
-		Nodes: []EvalNode{
-			&EvalInterpolate{
-				Config:   n.Config.RawConfig.Copy(),
-				Resource: resource,
-				Output:   &resourceConfig,
-			},
-			&EvalGetProvider{
-				Name:   n.ResolvedProvider,
-				Output: &provider,
-			},
-			// Re-run validation to catch any errors we missed, e.g. type
-			// mismatches on computed values.
-			&EvalValidateResource{
-				Provider:       &provider,
-				Config:         &resourceConfig,
-				ResourceName:   n.Config.Name,
-				ResourceType:   n.Config.Type,
-				ResourceMode:   n.Config.Mode,
-				IgnoreWarnings: true,
-			},
-			&EvalReadState{
-				Name:   stateId,
-				Output: &state,
-			},
-			&EvalDiff{
-				Name:        stateId,
-				Info:        info,
-				Config:      &resourceConfig,
-				Resource:    n.Config,
-				Provider:    &provider,
-				State:       &state,
-				OutputDiff:  &diff,
-				OutputState: &state,
-			},
-			&EvalCheckPreventDestroy{
-				Resource: n.Config,
-				Diff:     &diff,
-			},
-			&EvalWriteState{
-				Name:         stateId,
-				ResourceType: n.Config.Type,
-				Provider:     n.ResolvedProvider,
-				Dependencies: stateDeps,
-				State:        &state,
-			},
-			&EvalWriteDiff{
-				Name: stateId,
-				Diff: &diff,
-			},
-		},
+	var change *plans.ResourceInstanceChange
+	var instanceRefreshState *states.ResourceInstanceObject
+	var instancePlanState *states.ResourceInstanceObject
+
+	_, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
+	diags = diags.Append(err)
+	if diags.HasErrors() {
+		return diags
 	}
+
+	diags = diags.Append(validateSelfRef(addr.Resource, config.Config, providerSchema))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	instanceRefreshState, err = n.readResourceInstanceState(ctx, addr)
+	diags = diags.Append(err)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	// In 0.13 we could be refreshing a resource with no config.
+	// We should be operating on managed resource, but check here to be certain
+	if n.Config == nil || n.Config.Managed == nil {
+		log.Printf("[WARN] managedResourceExecute: no Managed config value found in instance state for %q", n.Addr)
+	} else {
+		if instanceRefreshState != nil {
+			instanceRefreshState.CreateBeforeDestroy = n.Config.Managed.CreateBeforeDestroy || n.ForceCreateBeforeDestroy
+		}
+	}
+
+	// Refresh, maybe
+	if !n.skipRefresh {
+		s, refreshDiags := n.refresh(ctx, instanceRefreshState)
+		diags = diags.Append(refreshDiags)
+		if diags.HasErrors() {
+			return diags
+		}
+		instanceRefreshState = s
+
+		diags = diags.Append(n.writeResourceInstanceState(ctx, instanceRefreshState, n.Dependencies, refreshState))
+		if diags.HasErrors() {
+			return diags
+		}
+	}
+
+	// Plan the instance
+	change, instancePlanState, planDiags := n.plan(ctx, change, instanceRefreshState, n.ForceCreateBeforeDestroy)
+	diags = diags.Append(planDiags)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	diags = diags.Append(n.checkPreventDestroy(change))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	diags = diags.Append(n.writeResourceInstanceState(ctx, instancePlanState, n.Dependencies, workingState))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	diags = diags.Append(n.writeChange(ctx, change, ""))
+	return diags
 }

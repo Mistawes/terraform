@@ -11,48 +11,37 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/helper/pathorcontents"
-	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/httpclient"
+	"github.com/hashicorp/terraform/internal/legacy/helper/schema"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/option"
 )
 
-// gcsBackend implements "backend".Backend for GCS.
+// Backend implements "backend".Backend for GCS.
 // Input(), Validate() and Configure() are implemented by embedding *schema.Backend.
 // State(), DeleteState() and States() are implemented explicitly.
-type gcsBackend struct {
+type Backend struct {
 	*schema.Backend
 
 	storageClient  *storage.Client
 	storageContext context.Context
 
-	bucketName       string
-	prefix           string
-	defaultStateFile string
+	bucketName string
+	prefix     string
 
 	encryptionKey []byte
-
-	projectID string
-	region    string
 }
 
 func New() backend.Backend {
-	be := &gcsBackend{}
-	be.Backend = &schema.Backend{
-		ConfigureFunc: be.configure,
+	b := &Backend{}
+	b.Backend = &schema.Backend{
+		ConfigureFunc: b.configure,
 		Schema: map[string]*schema.Schema{
 			"bucket": {
 				Type:        schema.TypeString,
 				Required:    true,
 				Description: "The name of the Google Cloud Storage bucket",
-			},
-
-			"path": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: "Path of the default state file",
-				Deprecated:  "Use the \"prefix\" option instead",
 			},
 
 			"prefix": {
@@ -68,6 +57,31 @@ func New() backend.Backend {
 				Default:     "",
 			},
 
+			"access_token": {
+				Type:     schema.TypeString,
+				Optional: true,
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{
+					"GOOGLE_OAUTH_ACCESS_TOKEN",
+				}, nil),
+				Description: "An OAuth2 token used for GCP authentication",
+			},
+
+			"impersonate_service_account": {
+				Type:     schema.TypeString,
+				Optional: true,
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{
+					"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+				}, nil),
+				Description: "The service account to impersonate for all Google API Calls",
+			},
+
+			"impersonate_service_account_delegates": {
+				Type:        schema.TypeList,
+				Optional:    true,
+				Description: "The delegation chain for the impersonated service account",
+				Elem:        &schema.Schema{Type: schema.TypeString},
+			},
+
 			"encryption_key": {
 				Type:        schema.TypeString,
 				Optional:    true,
@@ -80,6 +94,7 @@ func New() backend.Backend {
 				Optional:    true,
 				Description: "Google Cloud Project ID",
 				Default:     "",
+				Removed:     "Please remove this attribute. It is not used since the backend no longer creates the bucket if it does not yet exist.",
 			},
 
 			"region": {
@@ -87,14 +102,15 @@ func New() backend.Backend {
 				Optional:    true,
 				Description: "Region / location in which to create the bucket",
 				Default:     "",
+				Removed:     "Please remove this attribute. It is not used since the backend no longer creates the bucket if it does not yet exist.",
 			},
 		},
 	}
 
-	return be
+	return b
 }
 
-func (b *gcsBackend) configure(ctx context.Context) error {
+func (b *Backend) configure(ctx context.Context) error {
 	if b.storageClient != nil {
 		return nil
 	}
@@ -113,29 +129,31 @@ func (b *gcsBackend) configure(ctx context.Context) error {
 		b.prefix = b.prefix + "/"
 	}
 
-	b.defaultStateFile = strings.TrimLeft(data.Get("path").(string), "/")
-
-	b.projectID = data.Get("project").(string)
-	if id := os.Getenv("GOOGLE_PROJECT"); b.projectID == "" && id != "" {
-		b.projectID = id
-	}
-	b.region = data.Get("region").(string)
-	if r := os.Getenv("GOOGLE_REGION"); b.projectID == "" && r != "" {
-		b.region = r
-	}
-
 	var opts []option.ClientOption
 
-	creds := data.Get("credentials").(string)
-	if creds == "" {
+	// Add credential source
+	var creds string
+	var tokenSource oauth2.TokenSource
+
+	if v, ok := data.GetOk("access_token"); ok {
+		tokenSource = oauth2.StaticTokenSource(&oauth2.Token{
+			AccessToken: v.(string),
+		})
+	} else if v, ok := data.GetOk("credentials"); ok {
+		creds = v.(string)
+	} else if v := os.Getenv("GOOGLE_BACKEND_CREDENTIALS"); v != "" {
+		creds = v
+	} else {
 		creds = os.Getenv("GOOGLE_CREDENTIALS")
 	}
 
-	if creds != "" {
+	if tokenSource != nil {
+		opts = append(opts, option.WithTokenSource(tokenSource))
+	} else if creds != "" {
 		var account accountFile
 
 		// to mirror how the provider works, we accept the file path or the contents
-		contents, _, err := pathorcontents.Read(creds)
+		contents, err := backend.ReadPathOrContents(creds)
 		if err != nil {
 			return fmt.Errorf("Error loading credentials: %s", err)
 		}
@@ -148,12 +166,30 @@ func (b *gcsBackend) configure(ctx context.Context) error {
 			Email:      account.ClientEmail,
 			PrivateKey: []byte(account.PrivateKey),
 			Scopes:     []string{storage.ScopeReadWrite},
-			TokenURL:   "https://accounts.google.com/o/oauth2/token",
+			TokenURL:   "https://oauth2.googleapis.com/token",
 		}
 
 		opts = append(opts, option.WithHTTPClient(conf.Client(ctx)))
 	} else {
 		opts = append(opts, option.WithScopes(storage.ScopeReadWrite))
+	}
+
+	// Service Account Impersonation
+	if v, ok := data.GetOk("impersonate_service_account"); ok {
+		ServiceAccount := v.(string)
+		opts = append(opts, option.ImpersonateCredentials(ServiceAccount))
+
+		if v, ok := data.GetOk("impersonate_service_account_delegates"); ok {
+			var delegates []string
+			d := v.([]interface{})
+			if len(delegates) > 0 {
+				delegates = make([]string, len(d))
+			}
+			for _, delegate := range d {
+				delegates = append(delegates, delegate.(string))
+			}
+			opts = append(opts, option.ImpersonateCredentials(ServiceAccount, delegates...))
+		}
 	}
 
 	opts = append(opts, option.WithUserAgent(httpclient.UserAgentString()))
@@ -170,7 +206,7 @@ func (b *gcsBackend) configure(ctx context.Context) error {
 	}
 
 	if key != "" {
-		kc, _, err := pathorcontents.Read(key)
+		kc, err := backend.ReadPathOrContents(key)
 		if err != nil {
 			return fmt.Errorf("Error loading encryption key: %s", err)
 		}
